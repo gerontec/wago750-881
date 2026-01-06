@@ -76,17 +76,32 @@ chmod +x heizung2.py heizung3.py reset_runtime.py
 | 12412-12416 | Overrides |
 | 512 | %QB0 (Physische Ausgänge) |
 
-## Versionen
+# WAGO 750-881 Heizungssteuerung
 
-- **SPS**: v6.4.8
-- **heizung3.py**: v3.8.3
-- **heizung2.py**: v3.9.1
-- **DB Schema**: V7
+Projekt für die Steuerung einer Heizung (WW, HK, Brunnen) mit einer WAGO 750-881 PLC.
 
-## Lizenz
+## Modbus Register Mapping (Holding Registers, Slave 0)
 
-MIT License
+### Messwerte (xMeasure[1..32]) – ab Adresse 12320 (%MW32 - %MW63)
+- %MW32-35: Physische Analog Inputs %IW0-%IW3 (Raw 0-32767)
+- %MW36: Digital Input %IW4 (DI8chan)
+- %MW42: Status Word (Bit4=Mux Phase A/B, Bit5=Data Ready, Bit3=Nacht, Bit6=Sensor Error)
+- %MW63: Physischer Output Byte %QB0
 
-## Autor
+Sample & Hold + berechnete Werte siehe wagostatus.py.
 
-[gerontec](https://github.com/gerontec)
+### Sollwerte (xSetpoints[1..16]) – ab Adresse 12384 (%MW96 - %MW111)
+- %MW100: Nacht Start/End
+- %MW109: Frostschwelle, Tank-Temp usw.
+- %MW112-115: Overrides
+
+### System-Diagnose (xSystem[1..8]) – ab Adresse 12416 (%MW128 - %MW135)
+- %MW128/129: Uptime (32-Bit)
+- %MW130: Error Count
+- %MW131: CPU Load %
+
+## Skripte
+- wagostatus.py: Vollständiger Status-Überblick (physische I/O + alle Variablen)
+- heizung2.py / heizung3.py: Steuerlogik
+
+Version: 1.1.0 (06.01.2026)
