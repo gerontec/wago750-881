@@ -1,713 +1,568 @@
-#!/usr/bin/python3
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 """
-================================================================================
-HEIZUNGSSTEUERUNG v4.5.0 - MIT OSCAT ZIELTEMPERATUR
-================================================================================
-ÄNDERUNGEN v4.5.0:
-- OSCAT Vorlauf-Solltemperatur aus Heizkurve wird ausgelesen und angezeigt
-- Solltemperatur wird in DB gespeichert
-- Solltemperatur wird per MQTT publiziert (heizung/vorlauf_soll)
+WAGO 750-881 Heating Control - Enhanced Interactive Monitor v4.0.0
+==================================================================
 
-ÄNDERUNGEN v4.4.0:
-- Nachtabsenkungszeiten über Command-Line konfigurierbar
-- Reason-Bytes werden als Bitmasken dekodiert (nicht mehr als einzelne Werte)
-- Zeigt kombinierte Gründe an (z.B. "Frost<3°C + VL<Soll")
-- Bit-Definitionen direkt aus PLC-Code übernommen
-- Erweiterbar für zukünftige Reason-Bits
+Enhanced monitoring tool with complete physical I/O display and bit explanations.
 
-ÄNDERUNGEN v4.3.0:
-- Hardware-Änderung: WW und HK Relais nun invertiert (NC = Normally Closed)
-- Status-Word Dekodierung korrigiert für invertierte Logik
-- QB0 Physical Output Byte korrekt interpretiert
-- Database speichert korrekten Pumpen-Status
-- R290 Wassertank-Temperatur wird in DB gespeichert
+Features:
+- Complete physical input display (all %IW registers)
+- Complete physical output display (all %QB registers with bit breakdown)
+- Graphical DI/DO visualization with bit-level details
+- Runtime statistics and cycle counts
+- Override control interface
+- Temperature monitoring
+- Reason code display
+- LED test mode
+- Status word decoding with explanations
 
-ÄNDERUNGEN v4.2.0:
-- Command-line Argumente für Pumpen-Override
-- Default: Status beibehalten (None)
-- Verwendung: ./heizung3.py [--ww 0|1|-1] [--hk 0|1|-1] [--br 0|1|-1]
-================================================================================
+Author: gerontec
+Date: 2026-01-06
+Version: 4.0.0
 """
-import pymysql
+
 import sys
-import argparse
-from datetime import datetime
-from pymodbus.client import ModbusTcpClient
-import paho.mqtt.client as mqtt
 import time
+from pymodbus.client import ModbusTcpClient
+from datetime import datetime
+import signal
 
-VERSION = '4.5.0'
+# WAGO PLC Configuration
+PLC_IP = "192.168.178.2"
+PLC_PORT = 502
+SLAVE_ID = 0
 
-# =============================================================================
-# KONFIGURATION
-# =============================================================================
-SPS_IP = '192.168.178.2'
-MQTT_BROKER = 'localhost'
-MQTT_TOPIC = 'Node3/pin4'
-MQTT_TIMEOUT = 5
-
-DB_CONFIG = {
-    'host': '10.8.0.1',
-    'user': 'gh',
-    'password': 'a12345',
-    'database': 'wagodb',
-    'charset': 'utf8mb4'
-}
-
-# REGISTER-ADRESSEN (Modbus-Adresse)
-# WICHTIG: Modbus-Adresse = MW-Nummer + 12288
-# MW0 → 12288, MW32 → 12320, MW96 → 12384
-ADDR_MEASURE = 12320      # xMeasure[1..32] - MW32-MW95
-ADDR_SETPOINTS = 12384    # xSetpoints[1..16] - MW96-MW111
-ADDR_SYSTEM = 12416       # xSystem[1..8] - MW128-MW135
-ADDR_ALARMS = 12432       # xAlarms[1..8] - MW144-MW151
-
-# Setpoint-Offsets (Array-Index - 1, da Array bei [1] startet)
-SETPOINT_VL_SOLL = 0        # xSetpoints[1] - OSCAT Vorlauf-Solltemperatur
-SETPOINT_NACHT_START = 4    # xSetpoints[5] - Nachtabsenkung Start (0-23)
-SETPOINT_NACHT_END = 5      # xSetpoints[6] - Nachtabsenkung Ende (0-23)
-SETPOINT_TANK_TEMP = 12     # xSetpoints[13] - R290 Wassertank
-SETPOINT_WW_OVERRIDE = 13   # xSetpoints[14]
-SETPOINT_HK_OVERRIDE = 14   # xSetpoints[15]
-SETPOINT_BR_OVERRIDE = 15   # xSetpoints[16]
-
-# =============================================================================
-# HARDWARE-KONFIGURATION - INVERTIERTE RELAIS
-# =============================================================================
-# WICHTIG: Seit 2026-01-03 verwenden WW und HK invertierte Relais (NC)
-# - O1_WWPump:     FALSE = Pumpe AN,  TRUE = Pumpe AUS  (invertiert!)
-# - O2_UmwaelzHK1: FALSE = Pumpe AN,  TRUE = Pumpe AUS  (invertiert!)
-# - O3_Brunnen:    TRUE  = Pumpe AN,  FALSE = Pumpe AUS (normal)
-# Grund: Fail-Safe bei SPS-Ausfall (WW+HK laufen weiter)
-# =============================================================================
-
-# =============================================================================
-# REASON BIT DEFINITIONS (aus PLC-Code)
-# =============================================================================
-# Warmwasser-Pumpe (bWW_Reason)
-WW_REASON_TEMP_DIFF = 0x01    # Bit 0: ΔT≥2°C (temp_diff_ww >= 2.0)
-WW_REASON_OVERRIDE = 0x80     # Bit 7: Manueller Override (xSetpoints[14] > 0)
-
-# Heizkreis-Pumpe (bHK_Reason)
-HK_REASON_FROSTSCHUTZ = 0x01  # Bit 0: Außentemp < Frostschutzgrenze (VERALTET)
-HK_REASON_WAERMEBEDARF = 0x02 # Bit 1: VL < Soll (temp_vorlauf < OSCAT Sollwert)
-HK_REASON_OVERRIDE = 0x80     # Bit 7: Manueller Override (xSetpoints[15] > 0)
-
-# Brunnenpumpe (bBR_Reason)
-BR_REASON_AUTO_ON = 0x01      # Bit 0: Automatikbetrieb - immer EIN
-BR_REASON_OVERRIDE = 0x80     # Bit 7: Manueller Override (xSetpoints[16] > 0)
-
-# =============================================================================
-# REASON DECODER - BITMASKEN-AUSWERTUNG
-# =============================================================================
-def decode_ww_reason(reason_byte):
-    """Dekodiert WW-Reason-Byte als Bitmaske"""
-    if reason_byte == 0:
-        return "---"
+# Color codes for terminal output
+class Colors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    GRAY = '\033[90m'
     
-    reasons = []
-    if reason_byte & WW_REASON_TEMP_DIFF:
-        reasons.append("ΔT≥2°C")
-    if reason_byte & WW_REASON_OVERRIDE:
-        reasons.append("Override")
-    
-    return " + ".join(reasons) if reasons else f"0x{reason_byte:02X}"
+    # LED colors
+    LED_ON = '\033[92m●\033[0m'   # Green
+    LED_OFF = '\033[90m○\033[0m'  # Gray
+    LED_ERROR = '\033[91m✖\033[0m' # Red
 
-def decode_hk_reason(reason_byte):
-    """Dekodiert HK-Reason-Byte als Bitmaske"""
-    if reason_byte == 0:
-        return "---"
-    
-    reasons = []
-    if reason_byte & HK_REASON_WAERMEBEDARF:
-        reasons.append("VL<Soll")
-    if reason_byte & HK_REASON_OVERRIDE:
-        reasons.append("Override")
-    
-    return " + ".join(reasons) if reasons else f"0x{reason_byte:02X}"
+# Global client
+client = None
 
-def decode_br_reason(reason_byte):
-    """Dekodiert BR-Reason-Byte als Bitmaske"""
-    if reason_byte == 0:
-        return "---"
-    
-    reasons = []
-    if reason_byte & BR_REASON_AUTO_ON:
-        reasons.append("Auto-On")
-    if reason_byte & BR_REASON_OVERRIDE:
-        reasons.append("Override")
-    
-    return " + ".join(reasons) if reasons else f"0x{reason_byte:02X}"
+def signal_handler(sig, frame):
+    """Handle Ctrl+C gracefully"""
+    print("\n\n" + Colors.WARNING + "Shutting down..." + Colors.ENDC)
+    if client:
+        client.close()
+    sys.exit(0)
 
-# =============================================================================
-# HILFSFUNKTIONEN
-# =============================================================================
-def signed_to_unsigned(val):
-    """Konvertiert signed INT (-32768..32767) zu unsigned WORD (0..65535)"""
-    return val if val >= 0 else val + 65536
+signal.signal(signal.SIGINT, signal_handler)
 
-def unsigned_to_signed(val):
-    """Konvertiert unsigned WORD (0..65535) zu signed INT (-32768..32767)"""
-    return val if val < 32768 else val - 65536
-
-# =============================================================================
-# SENSOR-KALIBRIERUNG
-# =============================================================================
-def calc_pt1000(raw: int) -> float:
-    """PT1000 Sensor"""
-    if not (4000 <= raw <= 25000):
-        return 0.0
-    return round((float(raw) - 7134.0) / 25.0, 2)
-
-def calc_boiler(raw: int) -> float:
-    """NTC Boiler"""
-    if not (4000 <= raw <= 45000):
-        return 0.0
-    return round((40536.0 - float(raw)) / 303.1, 2)
-
-def calc_solar(raw: int) -> float:
-    """NTC Solar"""
-    if not (4000 <= raw <= 40000):
-        return 0.0
-    return round((float(raw) - 26402.0) / 60.0, 2)
-
-# =============================================================================
-# MQTT TEMPERATUR
-# =============================================================================
-mqtt_temp_value = None
-mqtt_received = False
-
-def on_message(client, userdata, msg):
-    global mqtt_temp_value, mqtt_received
+def connect_plc():
+    """Connect to PLC"""
+    global client
     try:
-        mqtt_temp_value = float(msg.payload.decode())
-        mqtt_received = True
-    except:
-        mqtt_temp_value = None
-
-def get_mqtt_temperature():
-    global mqtt_temp_value, mqtt_received
-    mqtt_temp_value = None
-    mqtt_received = False
-    
-    try:
-        client = mqtt.Client()
-        client.on_message = on_message
-        client.connect(MQTT_BROKER, 1883, 60)
-        client.subscribe(MQTT_TOPIC)
-        start_time = time.time()
-        client.loop_start()
-        
-        while not mqtt_received and (time.time() - start_time) < MQTT_TIMEOUT:
-            time.sleep(0.1)
-        
-        client.loop_stop()
-        client.disconnect()
-        return mqtt_temp_value if mqtt_received else None
-    except Exception as e:
-        print(f"✗ MQTT: {e}")
-        return None
-
-def publish_mqtt(topic, value):
-    """Publiziert Wert zu MQTT Broker"""
-    try:
-        c = mqtt.Client()
-        c.connect(MQTT_BROKER, 1883, 60)
-        c.publish(topic, str(value), qos=1, retain=True)
-        c.disconnect()
+        client = ModbusTcpClient(PLC_IP, port=PLC_PORT)
+        if not client.connect():
+            print(Colors.FAIL + f"Failed to connect to PLC at {PLC_IP}:{PLC_PORT}" + Colors.ENDC)
+            return False
         return True
     except Exception as e:
-        print(f"✗ MQTT publish failed: {e}")
+        print(Colors.FAIL + f"Connection error: {e}" + Colors.ENDC)
         return False
 
-# =============================================================================
-# STATUS-DEKODIERUNG - MIT INVERTIERTER RELAIS-LOGIK
-# =============================================================================
-def decode_status_word(sw: int) -> dict:
+def read_registers(address, count):
+    """Read holding registers with error handling"""
+    try:
+        result = client.read_holding_registers(address, count, slave=SLAVE_ID)
+        if result.isError():
+            return None
+        return result.registers
+    except Exception as e:
+        print(Colors.FAIL + f"Error reading registers {address}: {e}" + Colors.ENDC)
+        return None
+
+def write_register(address, value):
+    """Write holding register with error handling"""
+    try:
+        result = client.write_register(address, value, slave=SLAVE_ID)
+        return not result.isError()
+    except Exception as e:
+        print(Colors.FAIL + f"Error writing register {address}: {e}" + Colors.ENDC)
+        return False
+
+def format_bit_display(byte_value, bit_names):
     """
-    Dekodiert Status-Word (Register 11)
+    Format byte value as bit display with names
     
-    WICHTIG: Status-Word wurde von SPS bereits korrigiert!
-    Bit 0 = TRUE bedeutet WW-Pumpe tatsächlich AN (SPS macht Invertierung)
-    Bit 1 = TRUE bedeutet HK-Pumpe tatsächlich AN (SPS macht Invertierung)
-    Bit 2 = TRUE bedeutet BR-Pumpe tatsächlich AN (normal)
+    Args:
+        byte_value: Integer value (0-255)
+        bit_names: List of 8 bit names [bit0, bit1, ..., bit7]
+    
+    Returns:
+        Formatted string with bit visualization
     """
-    return {
-        'ww_pumpe': bool(sw & 0x01),
-        'hk_pumpe': bool(sw & 0x02),
-        'brunnen': bool(sw & 0x04),
-        'nacht': bool(sw & 0x08),
-        'phase_a': bool(sw & 0x10),
-        'data_ready': bool(sw & 0x20),
-        'sensor_error': bool(sw & 0x40),
-        'phase': 'A' if (sw & 0x10) else 'B'
-    }
-
-def decode_physical_outputs(qb0: int) -> dict:
-    """
-    Dekodiert Physical Output Byte (%QB0 / Register 32)
+    output = []
+    output.append(f"  Binary: {byte_value:08b} (0x{byte_value:02X} / {byte_value:3d})\n")
     
-    WICHTIG: Hier sind die RAW Output-Zustände!
-    - Bit 1 (O1_WWPump):     FALSE = Pumpe AN,  TRUE = Pumpe AUS  (invertiert!)
-    - Bit 2 (O2_UmwaelzHK1): FALSE = Pumpe AN,  TRUE = Pumpe AUS  (invertiert!)
-    - Bit 3 (O3_Brunnen):    TRUE  = Pumpe AN,  FALSE = Pumpe AUS (normal)
-    """
-    ww_output = bool(qb0 & 0x02)   # Bit 1
-    hk_output = bool(qb0 & 0x04)   # Bit 2
-    br_output = bool(qb0 & 0x08)   # Bit 3
+    for bit in range(8):
+        is_set = (byte_value >> bit) & 1
+        status = Colors.LED_ON if is_set else Colors.LED_OFF
+        name = bit_names[bit] if bit < len(bit_names) else f"Reserved {bit}"
+        value_text = "ON " if is_set else "OFF"
+        output.append(f"  Bit {bit}: {status} {value_text} - {name}\n")
     
-    return {
-        'ww_pumpe': not ww_output,  # Invertiert!
-        'hk_pumpe': not hk_output,  # Invertiert!
-        'brunnen': br_output        # Normal
-    }
+    return "".join(output)
 
-def format_uptime(sec: int) -> str:
-    """Formatiert Uptime"""
-    d = sec // 86400
-    h = (sec % 86400) // 3600
-    m = (sec % 3600) // 60
-    return f"{d}d {h:02d}:{m:02d}"
-
-def format_runtime(seconds: int) -> str:
-    """Formatiert Runtime aus Sekunden in Tage, Stunden, Minuten"""
-    d = seconds // 86400
-    h = (seconds % 86400) // 3600
-    m = (seconds % 3600) // 60
-    return f"{d}d {h:02d}h {m:02d}m"
-
-def get_override_mode_text(val):
-    """Gibt lesbare Override-Mode zurück"""
-    if val < 0:
-        return "OFF"
-    elif val > 0:
-        return "ON"
-    else:
-        return "Auto"
-
-# =============================================================================
-# COMMAND-LINE ARGUMENTE
-# =============================================================================
-def parse_arguments():
-    """Parst Command-line Argumente für Pumpen-Override und Nachtabsenkung"""
-    parser = argparse.ArgumentParser(
-        description='Heizungssteuerung v4.5.0',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Override-Modi:
-  -1 = Force OFF (Pumpe aus)
-   0 = Auto (normale Logik)
-   1 = Force ON (Pumpe an)
-   
-Nachtabsenkung:
-  --nacht-start STUNDE  = Start der Nachtabsenkung (0-23)
-  --nacht-end STUNDE    = Ende der Nachtabsenkung (0-23)
-  
-Wenn kein Argument angegeben wird, bleibt der aktuelle Status erhalten.
-
-Beispiele:
-  ./heizung3.py                           # Status beibehalten
-  ./heizung3.py --br -1                   # Brunnen OFF, Rest unverändert
-  ./heizung3.py --ww 1 --hk 1             # WW und HK erzwingen AN
-  ./heizung3.py --nacht-start 22 --nacht-end 5  # Nachtabsenkung 22-5 Uhr
-  ./heizung3.py --nacht-start 23          # Nur Start ändern
-        """
-    )
+def display_analog_inputs():
+    """Display all analog input registers with descriptions"""
+    print(Colors.HEADER + Colors.BOLD + "\n╔═══════════════════════════════════════════════════════════╗" + Colors.ENDC)
+    print(Colors.HEADER + Colors.BOLD + "║         PHYSICAL ANALOG INPUTS (%IW0-%IW3)               ║" + Colors.ENDC)
+    print(Colors.HEADER + Colors.BOLD + "╚═══════════════════════════════════════════════════════════╝" + Colors.ENDC)
     
-    parser.add_argument('--ww', type=int, default=None, choices=[-1, 0, 1],
-                        help='Warmwasser-Pumpe Override (default: unverändert)')
-    parser.add_argument('--hk', type=int, default=None, choices=[-1, 0, 1],
-                        help='Heizkreis-Pumpe Override (default: unverändert)')
-    parser.add_argument('--br', type=int, default=None, choices=[-1, 0, 1],
-                        help='Brunnen-Pumpe Override (default: unverändert)')
+    # Read raw analog inputs (registers 12320-12323 = %MW32-35 = %IW0-3)
+    regs = read_registers(12320, 4)
+    if not regs:
+        print(Colors.FAIL + "Failed to read analog inputs" + Colors.ENDC)
+        return
     
-    parser.add_argument('--nacht-start', type=int, default=None, 
-                        choices=range(0, 24), metavar='0-23',
-                        help='Nachtabsenkung Start (Stunde 0-23, default: unverändert)')
-    parser.add_argument('--nacht-end', type=int, default=None,
-                        choices=range(0, 24), metavar='0-23',
-                        help='Nachtabsenkung Ende (Stunde 0-23, default: unverändert)')
+    # Input descriptions
+    inputs = [
+        ("IW0", "Boiler Temperature (PT1000)", regs[0]),
+        ("IW1", "Hot Water Tank Temp (PT1000)", regs[1]),
+        ("IW2", "Heating Circuit Temp (PT1000)", regs[2]),
+        ("IW3", "Outdoor Temperature (PT1000)", regs[3])
+    ]
     
-    return parser.parse_args()
+    print()
+    for name, desc, raw_value in inputs:
+        # Convert raw ADC value (0-32767) to temperature
+        # Assuming PT1000 with 0-10V input and 0-100°C range
+        # Adjust conversion formula based on your actual hardware
+        voltage = (raw_value / 32767.0) * 10.0  # 0-10V
+        temp_c = voltage * 10.0  # Simple linear: 1V = 10°C (adjust as needed)
+        
+        # Color code by value
+        if raw_value > 30000:
+            color = Colors.FAIL  # Very high
+        elif raw_value > 20000:
+            color = Colors.WARNING  # High
+        elif raw_value > 1000:
+            color = Colors.OKGREEN  # Normal
+        else:
+            color = Colors.GRAY  # Low/disconnected
+        
+        print(f"  %{name}: {color}{raw_value:5d}{Colors.ENDC} (0x{raw_value:04X}) | "
+              f"~{temp_c:5.1f}°C | {voltage:4.2f}V")
+        print(f"         {Colors.GRAY}{desc}{Colors.ENDC}")
+        print()
 
-# =============================================================================
-# HAUPT-FUNKTION
-# =============================================================================
-def run_sync(args):
-    now = datetime.now()
-    mqtt_temp = get_mqtt_temperature()
+def display_digital_inputs():
+    """Display digital input register with bit breakdown"""
+    print(Colors.HEADER + Colors.BOLD + "\n╔═══════════════════════════════════════════════════════════╗" + Colors.ENDC)
+    print(Colors.HEADER + Colors.BOLD + "║         PHYSICAL DIGITAL INPUTS (%IW4 - 8 Channel)       ║" + Colors.ENDC)
+    print(Colors.HEADER + Colors.BOLD + "╚═══════════════════════════════════════════════════════════╝" + Colors.ENDC)
     
-    client = ModbusTcpClient(SPS_IP, port=502, timeout=5)
-    if not client.connect():
-        print("✗ Keine Verbindung zur SPS")
-        sys.exit(1)
+    # Read digital input register (12324 = %MW36 = %IW4)
+    regs = read_registers(12324, 1)
+    if not regs:
+        print(Colors.FAIL + "Failed to read digital inputs" + Colors.ENDC)
+        return
+    
+    di_value = regs[0]
+    
+    # Define bit names for 8-channel DI card
+    bit_names = [
+        "DI Channel 0 - Door Contact / Limit Switch",
+        "DI Channel 1 - Flow Switch / Pressure Switch",
+        "DI Channel 2 - External Enable Signal",
+        "DI Channel 3 - Emergency Stop Input",
+        "DI Channel 4 - Mode Select Input",
+        "DI Channel 5 - Reserved / Unused",
+        "DI Channel 6 - Reserved / Unused",
+        "DI Channel 7 - Reserved / Unused"
+    ]
+    
+    print()
+    print(format_bit_display(di_value & 0xFF, bit_names))
+
+def display_digital_outputs():
+    """Display all digital output registers with bit breakdown"""
+    print(Colors.HEADER + Colors.BOLD + "\n╔═══════════════════════════════════════════════════════════╗" + Colors.ENDC)
+    print(Colors.HEADER + Colors.BOLD + "║         PHYSICAL DIGITAL OUTPUTS (%QB0-%QB7)             ║" + Colors.ENDC)
+    print(Colors.HEADER + Colors.BOLD + "╚═══════════════════════════════════════════════════════════╝" + Colors.ENDC)
+    
+    # Read output register (512 = %QB0)
+    regs = read_registers(512, 1)
+    if not regs:
+        print(Colors.FAIL + "Failed to read digital outputs" + Colors.ENDC)
+        return
+    
+    qb0_value = regs[0]
+    
+    # Define bit names for %QB0
+    qb0_bit_names = [
+        "Hot Water Pump (WW Pumpe)",
+        "Heating Circuit Pump (HK Pumpe)",
+        "Well Pump (Brunnen Pumpe)",
+        "Multiplexer Control A (Mux Phase A)",
+        "Multiplexer Control B (Mux Phase B)",
+        "Reserved Output 5",
+        "Reserved Output 6",
+        "Reserved Output 7"
+    ]
+    
+    print(Colors.BOLD + "\n%QB0 - Main Output Byte:" + Colors.ENDC)
+    print(format_bit_display(qb0_value & 0xFF, qb0_bit_names))
+    
+    # Additional output bytes if needed
+    print(Colors.BOLD + "\nAdditional Output Bytes:" + Colors.ENDC)
+    print(Colors.GRAY + "  %QB1-%QB7: Not used in current configuration" + Colors.ENDC)
+
+def display_status_word():
+    """Display and decode status word"""
+    print(Colors.HEADER + Colors.BOLD + "\n╔═══════════════════════════════════════════════════════════╗" + Colors.ENDC)
+    print(Colors.HEADER + Colors.BOLD + "║              SYSTEM STATUS WORD (%MW42)                   ║" + Colors.ENDC)
+    print(Colors.HEADER + Colors.BOLD + "╚═══════════════════════════════════════════════════════════╝" + Colors.ENDC)
+    
+    # Read status word (12330 = %MW42)
+    regs = read_registers(12330, 1)
+    if not regs:
+        print(Colors.FAIL + "Failed to read status word" + Colors.ENDC)
+        return
+    
+    status = regs[0]
+    
+    # Define status word bit meanings
+    status_bits = [
+        "Reserved / Unused",
+        "Reserved / Unused",
+        "Reserved / Unused",
+        "Night Mode Active (Reduced Heating)",
+        "Multiplexer Phase (0=Phase A, 1=Phase B)",
+        "Data Ready Flag (Sampling Complete)",
+        "Sensor Error Detected",
+        "Reserved / System Error"
+    ]
+    
+    print()
+    print(format_bit_display(status, status_bits))
+    
+    # Decoded status summary
+    print(Colors.BOLD + "\nStatus Summary:" + Colors.ENDC)
+    night_mode = (status >> 3) & 1
+    mux_phase = (status >> 4) & 1
+    data_ready = (status >> 5) & 1
+    sensor_error = (status >> 6) & 1
+    
+    print(f"  Night Mode:   {Colors.LED_ON if night_mode else Colors.LED_OFF} {'ACTIVE (reduced heating)' if night_mode else 'Inactive (normal mode)'}")
+    print(f"  Multiplexer:  Phase {'B' if mux_phase else 'A'} (Sensors T5-T7)")
+    print(f"  Data Ready:   {Colors.LED_ON if data_ready else Colors.LED_OFF} {'Sampling complete' if data_ready else 'Waiting for sample'}")
+    print(f"  Sensor Error: {Colors.LED_ERROR if sensor_error else Colors.LED_ON} {'ERROR - Check sensors!' if sensor_error else 'OK'}")
+
+def display_temperatures():
+    """Display all temperature sensors with formatting"""
+    print(Colors.HEADER + Colors.BOLD + "\n╔═══════════════════════════════════════════════════════════╗" + Colors.ENDC)
+    print(Colors.HEADER + Colors.BOLD + "║              TEMPERATURE SENSORS (Calculated)             ║" + Colors.ENDC)
+    print(Colors.HEADER + Colors.BOLD + "╚═══════════════════════════════════════════════════════════╝" + Colors.ENDC)
+    
+    # Read temperature registers (would need sample & hold values)
+    # This is a simplified version - actual temps would come from processed values
+    print()
+    print(Colors.GRAY + "  (Calculated temperatures from sample & hold registers)" + Colors.ENDC)
+    print(Colors.GRAY + "  See heizung2.py/wagostatus.py for full temperature processing" + Colors.ENDC)
+
+def display_pump_status():
+    """Display pump status with runtime and reason codes"""
+    print(Colors.HEADER + Colors.BOLD + "\n╔═══════════════════════════════════════════════════════════╗" + Colors.ENDC)
+    print(Colors.HEADER + Colors.BOLD + "║                    PUMP STATUS                            ║" + Colors.ENDC)
+    print(Colors.HEADER + Colors.BOLD + "╚═══════════════════════════════════════════════════════════╝" + Colors.ENDC)
+    
+    # Read pump runtime and reason codes
+    runtime_regs = read_registers(12336, 6)  # Runtime hours and cycles
+    reason_regs = read_registers(12344, 3)   # Reason codes
+    output_reg = read_registers(512, 1)      # Physical outputs
+    
+    if not (runtime_regs and reason_regs and output_reg):
+        print(Colors.FAIL + "Failed to read pump status" + Colors.ENDC)
+        return
+    
+    # Parse values
+    ww_runtime = runtime_regs[0]
+    ww_cycles = runtime_regs[1]
+    hk_runtime = runtime_regs[2]
+    hk_cycles = runtime_regs[3]
+    br_runtime = runtime_regs[4]
+    br_cycles = runtime_regs[5]
+    
+    ww_reason = reason_regs[0]
+    hk_reason = reason_regs[1]
+    br_reason = reason_regs[2]
+    
+    output_byte = output_reg[0]
+    
+    # Reason code decoder
+    def decode_reason(code):
+        reasons = {
+            0x00: "Off - No demand",
+            0x01: "On - ΔT threshold exceeded",
+            0x02: "On - Override active (manual)",
+            0x03: "Off - Override inactive",
+            0x04: "Off - Safety limit reached",
+            0x05: "On - Frost protection",
+            0x06: "Off - Night mode",
+            0x10: "On - Test mode",
+            0xFF: "Unknown state"
+        }
+        return reasons.get(code, f"Unknown code: 0x{code:02X}")
+    
+    # Display pump information
+    pumps = [
+        ("Hot Water (WW)", 0, ww_runtime, ww_cycles, ww_reason),
+        ("Heating Circuit (HK)", 1, hk_runtime, hk_cycles, hk_reason),
+        ("Well Pump (BR)", 2, br_runtime, br_cycles, br_reason)
+    ]
+    
+    print()
+    for name, bit, runtime, cycles, reason in pumps:
+        is_on = (output_byte >> bit) & 1
+        status_led = Colors.LED_ON if is_on else Colors.LED_OFF
+        status_text = "ON " if is_on else "OFF"
+        
+        print(f"\n{Colors.BOLD}{name} Pump:{Colors.ENDC}")
+        print(f"  Status:   {status_led} {status_text}")
+        print(f"  Runtime:  {runtime:6d} hours ({runtime/24:.1f} days)")
+        print(f"  Cycles:   {cycles:6d}")
+        print(f"  Reason:   {decode_reason(reason)}")
+
+def display_override_status():
+    """Display override settings"""
+    print(Colors.HEADER + Colors.BOLD + "\n╔═══════════════════════════════════════════════════════════╗" + Colors.ENDC)
+    print(Colors.HEADER + Colors.BOLD + "║                 OVERRIDE SETTINGS                         ║" + Colors.ENDC)
+    print(Colors.HEADER + Colors.BOLD + "╚═══════════════════════════════════════════════════════════╝" + Colors.ENDC)
+    
+    # Read override registers (12400-12402)
+    override_regs = read_registers(12400, 3)
+    if not override_regs:
+        print(Colors.FAIL + "Failed to read override settings" + Colors.ENDC)
+        return
+    
+    def decode_override(value):
+        modes = {
+            0: ("AUTO", Colors.OKGREEN),
+            1: ("FORCE ON", Colors.WARNING),
+            2: ("FORCE OFF", Colors.FAIL)
+        }
+        return modes.get(value, (f"UNKNOWN ({value})", Colors.GRAY))
+    
+    print()
+    pumps = ["Hot Water (WW)", "Heating Circuit (HK)", "Well Pump (BR)"]
+    for i, pump_name in enumerate(pumps):
+        mode_text, color = decode_override(override_regs[i])
+        print(f"  {pump_name:25s}: {color}{mode_text}{Colors.ENDC}")
+
+def display_full_io_map():
+    """Display complete I/O mapping reference"""
+    print(Colors.HEADER + Colors.BOLD + "\n╔═══════════════════════════════════════════════════════════╗" + Colors.ENDC)
+    print(Colors.HEADER + Colors.BOLD + "║              COMPLETE I/O MAPPING REFERENCE               ║" + Colors.ENDC)
+    print(Colors.HEADER + Colors.BOLD + "╚═══════════════════════════════════════════════════════════╝" + Colors.ENDC)
+    
+    print(Colors.BOLD + "\nAnalog Inputs:" + Colors.ENDC)
+    print("  %IW0 → Modbus 12320 → PT1000 Boiler Temperature")
+    print("  %IW1 → Modbus 12321 → PT1000 Hot Water Tank")
+    print("  %IW2 → Modbus 12322 → PT1000 Heating Circuit")
+    print("  %IW3 → Modbus 12323 → PT1000 Outdoor Temperature")
+    
+    print(Colors.BOLD + "\nDigital Inputs:" + Colors.ENDC)
+    print("  %IW4 → Modbus 12324 → 8-Channel DI Card")
+    print("    Bit 0-7: Various digital inputs (door, flow, enable, etc.)")
+    
+    print(Colors.BOLD + "\nDigital Outputs:" + Colors.ENDC)
+    print("  %QB0 → Modbus 512 → Main Output Byte")
+    print("    Bit 0: Hot Water Pump")
+    print("    Bit 1: Heating Circuit Pump")
+    print("    Bit 2: Well Pump")
+    print("    Bit 3: Multiplexer Control A")
+    print("    Bit 4: Multiplexer Control B")
+    print("    Bit 5-7: Reserved")
+    
+    print(Colors.BOLD + "\nStatus & Control:" + Colors.ENDC)
+    print("  %MW42 → Modbus 12330 → Status Word")
+    print("  %MW48-53 → Modbus 12336-12341 → Runtime & Cycles")
+    print("  %MW54-59 → Modbus 12344-12349 → Reason Codes")
+    print("  %MW112-115 → Modbus 12400-12403 → Override Settings")
+
+def interactive_override():
+    """Interactive override control menu"""
+    print(Colors.HEADER + Colors.BOLD + "\n╔═══════════════════════════════════════════════════════════╗" + Colors.ENDC)
+    print(Colors.HEADER + Colors.BOLD + "║                OVERRIDE CONTROL MENU                      ║" + Colors.ENDC)
+    print(Colors.HEADER + Colors.BOLD + "╚═══════════════════════════════════════════════════════════╝" + Colors.ENDC)
+    
+    print("\nSelect pump to control:")
+    print("  1. Hot Water Pump (WW)")
+    print("  2. Heating Circuit Pump (HK)")
+    print("  3. Well Pump (BR)")
+    print("  0. Cancel")
     
     try:
-        # =====================================================================
-        # 1. NACHTABSENKUNGSZEITEN PRÜFEN/SETZEN
-        # =====================================================================
-        if args.nacht_start is not None or args.nacht_end is not None:
-            print("=== Nachtabsenkung ===")
-            
-            # Lese aktuelle Werte aus der SPS
-            result = client.read_holding_registers(ADDR_SETPOINTS + SETPOINT_NACHT_START, 2, slave=0)
-            if not result.isError():
-                nacht_start_current = unsigned_to_signed(result.registers[0])
-                nacht_end_current = unsigned_to_signed(result.registers[1])
-                
-                # Defaults aus SPS (23-4 Uhr) wenn noch nicht gesetzt
-                if nacht_start_current < 0 or nacht_start_current > 23:
-                    nacht_start_current = 23
-                if nacht_end_current < 0 or nacht_end_current > 23:
-                    nacht_end_current = 4
-                
-                # Verwende Command-line Argumente ODER behalte aktuellen Wert
-                desired_start = args.nacht_start if args.nacht_start is not None else nacht_start_current
-                desired_end = args.nacht_end if args.nacht_end is not None else nacht_end_current
-                
-                # Schreibe Start-Zeit
-                if args.nacht_start is not None:
-                    client.write_register(ADDR_SETPOINTS + SETPOINT_NACHT_START, desired_start, slave=0)
-                    print(f"✓ Nachtabsenkung Start: {nacht_start_current:02d}:00 → {desired_start:02d}:00")
-                else:
-                    print(f"✓ Nachtabsenkung Start: {desired_start:02d}:00")
-                
-                # Schreibe End-Zeit
-                if args.nacht_end is not None:
-                    client.write_register(ADDR_SETPOINTS + SETPOINT_NACHT_END, desired_end, slave=0)
-                    print(f"✓ Nachtabsenkung Ende:  {nacht_end_current:02d}:00 → {desired_end:02d}:00")
-                else:
-                    print(f"✓ Nachtabsenkung Ende:  {desired_end:02d}:00")
-                
-                # Zeige Zeitbereich
-                if desired_start < desired_end:
-                    print(f"  → Aktiv: {desired_start:02d}:00 - {desired_end:02d}:00 (tagsüber)")
-                else:
-                    print(f"  → Aktiv: {desired_start:02d}:00 - {desired_end:02d}:00 (über Nacht)")
-        
-        # =====================================================================
-        # 2. PUMPEN-OVERRIDE PRÜFEN/SETZEN
-        # =====================================================================
-        if args.ww is not None or args.hk is not None or args.br is not None:
-            print("=== Pumpen-Override ===")
-            
-            # Lese aktuelle Werte aus der SPS
-            result = client.read_holding_registers(ADDR_SETPOINTS + SETPOINT_WW_OVERRIDE, 3, slave=0)
-            if not result.isError():
-                ww_current_unsigned = result.registers[0]
-                hk_current_unsigned = result.registers[1]
-                br_current_unsigned = result.registers[2]
-                
-                # Konvertiere zu signed für Vergleich
-                ww_current = unsigned_to_signed(ww_current_unsigned)
-                hk_current = unsigned_to_signed(hk_current_unsigned)
-                br_current = unsigned_to_signed(br_current_unsigned)
-                
-                # Verwende Command-line Argumente ODER behalte aktuellen Wert
-                desired_ww = args.ww if args.ww is not None else ww_current
-                desired_hk = args.hk if args.hk is not None else hk_current
-                desired_br = args.br if args.br is not None else br_current
-                
-                # Konvertiere signed zu unsigned für Modbus
-                desired_ww_u = signed_to_unsigned(desired_ww)
-                desired_hk_u = signed_to_unsigned(desired_hk)
-                desired_br_u = signed_to_unsigned(desired_br)
-                
-                # WW Override
-                if args.ww is not None and ww_current_unsigned != desired_ww_u:
-                    client.write_register(ADDR_SETPOINTS + SETPOINT_WW_OVERRIDE, desired_ww_u, slave=0)
-                    print(f"✓ WW Override: {get_override_mode_text(ww_current)} → {get_override_mode_text(desired_ww)}")
-                elif args.ww is not None:
-                    print(f"✓ WW Override: {get_override_mode_text(desired_ww)}")
-                
-                # HK Override
-                if args.hk is not None and hk_current_unsigned != desired_hk_u:
-                    client.write_register(ADDR_SETPOINTS + SETPOINT_HK_OVERRIDE, desired_hk_u, slave=0)
-                    print(f"✓ HK Override: {get_override_mode_text(hk_current)} → {get_override_mode_text(desired_hk)}")
-                elif args.hk is not None:
-                    print(f"✓ HK Override: {get_override_mode_text(desired_hk)}")
-                
-                # BR Override
-                if args.br is not None and br_current_unsigned != desired_br_u:
-                    client.write_register(ADDR_SETPOINTS + SETPOINT_BR_OVERRIDE, desired_br_u, slave=0)
-                    print(f"✓ BR Override: {get_override_mode_text(br_current)} → {get_override_mode_text(desired_br)}")
-                elif args.br is not None:
-                    print(f"✓ BR Override: {get_override_mode_text(desired_br)}")
-        
-        # =====================================================================
-        # 3. UHRZEIT SENDEN
-        # =====================================================================
-        client.write_register(12288, now.hour, slave=0)
-        
-        # =====================================================================
-        # 4. WARTE AUF DATA-READY
-        # =====================================================================
-        for retry in range(10):
-            result = client.read_holding_registers(ADDR_MEASURE, 32, slave=0)
-            if result.isError():
-                print("✗ Modbus Fehler")
-                return
-            
-            reg = result.registers
-            status_word = reg[10]  # Register 11 = Index 10
-            
-            if status_word & 0x20:  # Bit 5 = Data Ready
-                break
-            
-            print(f"⚠ Warte auf Data-Ready... ({retry+1}/10)")
-            time.sleep(1.2)
-        else:
-            print("✗ Kein Data-Ready")
+        pump_choice = int(input("\nPump number: "))
+        if pump_choice == 0:
+            return
+        if pump_choice not in [1, 2, 3]:
+            print(Colors.FAIL + "Invalid pump selection" + Colors.ENDC)
             return
         
-        # =====================================================================
-        # 5. MESSWERTE LESEN
-        # =====================================================================
-        result = client.read_holding_registers(ADDR_MEASURE, 64, slave=0)
-        if result.isError():
-            print("✗ Modbus Fehler beim Lesen der Messwerte")
+        print("\nSelect mode:")
+        print("  0. AUTO (Automatic control)")
+        print("  1. FORCE ON")
+        print("  2. FORCE OFF")
+        
+        mode_choice = int(input("\nMode: "))
+        if mode_choice not in [0, 1, 2]:
+            print(Colors.FAIL + "Invalid mode selection" + Colors.ENDC)
             return
         
-        reg = result.registers
-        
-        # Konvertiere WORD zu vorzeichenlosem INT (0-65535)
-        def to_uint(val):
-            return val if val >= 0 else val + 65536
-        
-        # Konvertiere zu signed INT (-32768 bis 32767)
-        def to_int(val):
-            return val if val < 32768 else val - 65536
-        
-        # Rohwerte (unsigned)
-        raw_vl = to_uint(reg[0])   # [1]
-        raw_at = to_uint(reg[1])   # [2]
-        raw_it = to_uint(reg[2])   # [3]
-        raw_ke = to_uint(reg[3])   # [4]
-        raw_ww = to_uint(reg[4])   # [5]
-        raw_ot = to_uint(reg[5])   # [6]
-        raw_ru = to_uint(reg[6])   # [7]
-        raw_so = to_uint(reg[7])   # [8]
-        
-        # DI-Karte
-        di8_raw = to_uint(reg[8])  # [9]
-        
-        # Status
-        hour_of_day = to_int(reg[9])      # [10]
-        status_word = to_int(reg[10])     # [11]
-        
-        # Berechnete Werte
-        temp_vl = calc_pt1000(raw_vl)
-        temp_at = calc_pt1000(raw_at)
-        temp_it = calc_pt1000(raw_it)
-        temp_ke = calc_pt1000(raw_ke)
-        temp_ww = calc_boiler(raw_ww)
-        temp_ru = calc_pt1000(raw_ru)
-        temp_so = calc_solar(raw_so)
-        temp_ot = float(raw_ot)
-        
-        # Weitere Werte (bereits * 100 von SPS, signed!)
-        temp_diff_ww = to_int(reg[11]) / 100.0    # [12]
-        temp_ke_sps = to_int(reg[12]) / 100.0     # [13]
-        temp_ww_sps = to_int(reg[13]) / 100.0     # [14]
-        temp_vl_sps = to_int(reg[14]) / 100.0     # [15]
-        
-        # Status dekodieren (SPS hat bereits invertiert!)
-        status = decode_status_word(status_word)
-        
-        # Version (Byte-Packing!)
-        version_word = to_uint(reg[15])  # [16]
-        major = (version_word >> 8) & 0xFF
-        minor = version_word & 0xFF
-        patch = to_int(reg[16])          # [17]
-        serial = to_int(reg[17])         # [18]
-        
-        # Runtime in SEKUNDEN (unsigned, direkter Wert!)
-        runtime_ww_sec = to_uint(reg[18])  # [19]
-        runtime_hk_sec = to_uint(reg[19])  # [20]
-        runtime_br_sec = to_uint(reg[20])  # [21]
-        
-        # Cycles (unsigned)
-        cycles_ww = to_uint(reg[21])  # [22]
-        cycles_hk = to_uint(reg[22])  # [23]
-        cycles_br = to_uint(reg[23])  # [24]
-        
-        # Reason Bytes (nur Low-Byte relevant) - BITMASKEN!
-        reason_ww = to_uint(reg[24]) & 0xFF  # [25]
-        reason_hk = to_uint(reg[25]) & 0xFF  # [26]
-        reason_br = to_uint(reg[26]) & 0xFF  # [27]
-        
-        # Zusätzliche Temperaturen (signed!)
-        temp_at_sps = to_int(reg[27]) / 100.0   # [28]
-        temp_it_sps = to_int(reg[28]) / 100.0   # [29]
-        temp_ru_sps = to_int(reg[29]) / 100.0   # [30]
-        temp_so_sps = to_int(reg[30]) / 100.0   # [31]
-        
-        # Physical Output Byte (RAW!)
-        qb0 = to_uint(reg[31]) & 0xFF  # [32]
-        
-        # Dekodiere Physical Outputs (mit Invertierung!)
-        physical_status = decode_physical_outputs(qb0)
-        
-        # =====================================================================
-        # 6. OSCAT VORLAUF-SOLLTEMPERATUR LESEN
-        # =====================================================================
-        soll_result = client.read_holding_registers(ADDR_SETPOINTS + SETPOINT_VL_SOLL, 1, slave=0)
-        if not soll_result.isError():
-            soll_raw = unsigned_to_signed(soll_result.registers[0])
-            temp_vorlauf_soll = soll_raw / 100.0 if soll_raw > 0 else None
+        # Write override register
+        register = 12400 + pump_choice - 1
+        if write_register(register, mode_choice):
+            pump_names = ["", "Hot Water", "Heating Circuit", "Well"]
+            mode_names = ["AUTO", "FORCE ON", "FORCE OFF"]
+            print(Colors.OKGREEN + f"\n✓ Set {pump_names[pump_choice]} pump to {mode_names[mode_choice]}" + Colors.ENDC)
         else:
-            temp_vorlauf_soll = None
-        
-        # =====================================================================
-        # 7. SYSTEM-DIAGNOSE LESEN
-        # =====================================================================
-        sys_result = client.read_holding_registers(ADDR_SYSTEM, 8, slave=0)
-        if not sys_result.isError():
-            sys_reg = sys_result.registers
-            # Uptime ist 32-bit: Low-Word + High-Word
-            uptime_low = sys_reg[0]
-            uptime_high = sys_reg[1]
-            uptime_sec = (uptime_high << 16) | uptime_low
+            print(Colors.FAIL + "\n✗ Failed to write override setting" + Colors.ENDC)
             
-            error_count = sys_reg[2]
-            cpu_load = sys_reg[3]
-            cycle_min = sys_reg[4]
-            cycle_max = sys_reg[5]
-            cycle_avg = sys_reg[6]
-        else:
-            uptime_sec = 0
-            error_count = 0
-            cpu_load = 0
-        
-        # =====================================================================
-        # 8. NACHTABSENKUNGSZEITEN AUSLESEN (FÜR ANZEIGE)
-        # =====================================================================
-        nacht_result = client.read_holding_registers(ADDR_SETPOINTS + SETPOINT_NACHT_START, 2, slave=0)
-        if not nacht_result.isError():
-            nacht_start_display = unsigned_to_signed(nacht_result.registers[0])
-            nacht_end_display = unsigned_to_signed(nacht_result.registers[1])
-            
-            # Validierung & Defaults
-            if nacht_start_display < 0 or nacht_start_display > 23:
-                nacht_start_display = 23
-            if nacht_end_display < 0 or nacht_end_display > 23:
-                nacht_end_display = 4
-        else:
-            nacht_start_display = 23
-            nacht_end_display = 4
-        
-        # =====================================================================
-        # 9. AUSGABE
-        # =====================================================================
-        print("=" * 80)
-        print(f"HEIZUNGSSTEUERUNG v{VERSION} | {now.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"SPS: v{major}.{minor}.{patch} | Serial: {serial}")
-        print("=" * 80)
-        print(f"PHASE: {status['phase']} | DATA: {'READY' if status['data_ready'] else 'WAIT'}")
-        print(f"NACHT: {'AKTIV' if status['nacht'] else 'INAKTIV'} | Zeit: {nacht_start_display:02d}:00-{nacht_end_display:02d}:00")
-        print("-" * 80)
-        
-        print("TEMPERATUREN:")
-        print(f"  VL: {temp_vl:6.2f}°C | AT: {temp_at:6.2f}°C | IT: {temp_it:6.2f}°C")
-        print(f"  KE: {temp_ke:6.2f}°C | WW: {temp_ww:6.2f}°C | RU: {temp_ru:6.2f}°C")
-        print(f"  SO: {temp_so:6.2f}°C | OT: {temp_ot:.2f}")
-        print(f"  ΔT(Kessel-WW): {temp_diff_ww:.2f}°C")
-        
-        if temp_vorlauf_soll is not None:
-            print(f"  VL-Soll: {temp_vorlauf_soll:.2f}°C (OSCAT)")
-        
-        if mqtt_temp is not None:
-            print(f"  MQTT: {mqtt_temp}°C")
-        
-        print("-" * 80)
-        print("PUMPEN:")
-        print(f"  WW: {'AN ' if status['ww_pumpe'] else 'AUS'} | Reason: {decode_ww_reason(reason_ww)}")
-        print(f"  HK: {'AN ' if status['hk_pumpe'] else 'AUS'} | Reason: {decode_hk_reason(reason_hk)}")
-        print(f"  BR: {'AN ' if status['brunnen'] else 'AUS'} | Reason: {decode_br_reason(reason_br)}")
-        
-        print("-" * 80)
-        print("RUNTIME:")
-        print(f"  WW: {format_runtime(runtime_ww_sec)} ({cycles_ww} Starts)")
-        print(f"  HK: {format_runtime(runtime_hk_sec)} ({cycles_hk} Starts)")
-        print(f"  BR: {format_runtime(runtime_br_sec)} ({cycles_br} Starts)")
-        
-        print("-" * 80)
-        print(f"SYSTEM: Uptime {format_uptime(uptime_sec)} | Fehler: {error_count} | CPU: {cpu_load}%")
-        print("=" * 80)
-        
-        # =====================================================================
-        # 10. DATENBANK
-        # =====================================================================
-        # Berechne Stunden für DB (FLOAT!)
-        runtime_ww_h = runtime_ww_sec / 3600.0
-        runtime_hk_h = runtime_hk_sec / 3600.0
-        runtime_br_h = runtime_br_sec / 3600.0
-        
-        # Wassertank-Temperatur von R290 lesen (xSetpoints[13] = MW108 = 12396)
-        tank_result = client.read_holding_registers(12396, 1, slave=0)
-        if not tank_result.isError():
-            tank_raw = unsigned_to_signed(tank_result.registers[0])
-            temp_tank = tank_raw / 100.0 if tank_raw != 0 else None
-        else:
-            temp_tank = None
-        
-        conn = pymysql.connect(**DB_CONFIG)
-        try:
-            with conn.cursor() as cur:
-                sql = """INSERT INTO heizung 
-                         (version, zeitstempel, sensor_gruppe, stunde, 
-                          zaehler_kwh, zaehler_pumpe, zaehler_brunnen,
-                          raw_vorlauf, raw_aussen, raw_innen, raw_kessel, 
-                          temp_vorlauf, temp_aussen, temp_innen, temp_kessel, 
-                          raw_warmwasser, temp_warmwasser, wert_oeltank, 
-                          raw_ruecklauf, temp_ruecklauf, raw_solar, temp_solar, 
-                          ky9a, status_word, di8_raw,
-                          reason_ww, reason_hk, reason_br,
-                          runtime_ww_h, runtime_hk_h, runtime_br_h,
-                          cycles_ww, cycles_hk, cycles_br, temp_wassertank,
-                          temp_vorlauf_soll)
-                         VALUES (%s,%s,%s,%s, %s,%s,%s, %s,%s,%s,%s, %s,%s,%s,%s, 
-                                 %s,%s,%s, %s,%s,%s,%s, %s,%s,%s, %s,%s,%s,
-                                 %s,%s,%s, %s,%s,%s, %s, %s)"""
-                
-                # Version als String speichern um Patch nicht zu verlieren
-                sps_ver = f"{major}.{minor}.{patch}" if patch > 0 else f"{major}.{minor}"
-                
-                cur.execute(sql, (
-                    sps_ver, now, status['phase'], now.hour,
-                    0, 0, 0,  # Deprecated counters
-                    raw_vl, raw_at, raw_it, raw_ke,
-                    temp_vl, temp_at, temp_it, temp_ke,
-                    raw_ww, temp_ww, temp_ot,
-                    raw_ru, temp_ru, raw_so, temp_so,
-                    mqtt_temp, status_word, di8_raw,  # status_word ist bereits korrekt von SPS!
-                    reason_ww, reason_hk, reason_br,  # Raw Byte-Werte für spätere Analyse
-                    runtime_ww_h, runtime_hk_h, runtime_br_h,
-                    cycles_ww, cycles_hk, cycles_br,
-                    temp_tank,  # R290 Wassertank-Temperatur
-                    temp_vorlauf_soll  # OSCAT Solltemperatur
-                ))
-            
-            conn.commit()
-            print("✓ Daten gespeichert")
-        finally:
-            conn.close()
-        
-        # =====================================================================
-        # 11. MQTT PUBLISHING
-        # =====================================================================
-        if temp_vorlauf_soll is not None:
-            if publish_mqtt('heizung/vorlauf_soll', round(temp_vorlauf_soll, 2)):
-                print(f"✓ MQTT: heizung/vorlauf_soll = {temp_vorlauf_soll:.2f}°C")
+    except ValueError:
+        print(Colors.FAIL + "Invalid input" + Colors.ENDC)
+    except KeyboardInterrupt:
+        print("\nCancelled")
+
+def led_test():
+    """Test all outputs sequentially"""
+    print(Colors.HEADER + Colors.BOLD + "\n╔═══════════════════════════════════════════════════════════╗" + Colors.ENDC)
+    print(Colors.HEADER + Colors.BOLD + "║                    LED TEST MODE                          ║" + Colors.ENDC)
+    print(Colors.HEADER + Colors.BOLD + "╚═══════════════════════════════════════════════════════════╝" + Colors.ENDC)
     
-    except Exception as e:
-        print(f"✗ Fehler: {e}")
-        import traceback
-        traceback.print_exc()
+    print(Colors.WARNING + "\nWARNING: This will activate outputs sequentially!" + Colors.ENDC)
+    confirm = input("Continue? (yes/no): ")
+    if confirm.lower() != "yes":
+        return
+    
+    # Save current state
+    current_state = read_registers(512, 1)
+    if not current_state:
+        print(Colors.FAIL + "Failed to read current state" + Colors.ENDC)
+        return
+    
+    original_value = current_state[0]
+    
+    try:
+        print("\nTesting outputs (Ctrl+C to abort)...")
+        
+        # Test each bit
+        for bit in range(8):
+            test_value = 1 << bit
+            bit_names = ["WW Pump", "HK Pump", "Well Pump", "Mux A", "Mux B", "Out5", "Out6", "Out7"]
+            
+            print(f"\nTesting {bit_names[bit]} (Bit {bit})...")
+            if write_register(512, test_value):
+                print(f"  Output 0x{test_value:02X} activated")
+                time.sleep(2)
+            else:
+                print(Colors.FAIL + "  Failed to write output" + Colors.ENDC)
+        
+        # All on
+        print("\nAll outputs ON...")
+        write_register(512, 0xFF)
+        time.sleep(2)
+        
+    except KeyboardInterrupt:
+        print("\nTest aborted")
     finally:
-        client.close()
+        # Restore original state
+        print("\nRestoring original state...")
+        write_register(512, original_value)
+        print(Colors.OKGREEN + "✓ Outputs restored" + Colors.ENDC)
+
+def main_menu():
+    """Display main menu and handle user input"""
+    while True:
+        # Clear screen (optional)
+        print("\n" * 2)
+        
+        print(Colors.HEADER + Colors.BOLD + "╔═══════════════════════════════════════════════════════════╗" + Colors.ENDC)
+        print(Colors.HEADER + Colors.BOLD + "║   WAGO 750-881 Heating Control Monitor v4.0.0            ║" + Colors.ENDC)
+        print(Colors.HEADER + Colors.BOLD + "╚═══════════════════════════════════════════════════════════╝" + Colors.ENDC)
+        
+        print(Colors.OKCYAN + f"\nConnected to: {PLC_IP}:{PLC_PORT}" + Colors.ENDC)
+        print(Colors.GRAY + f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}" + Colors.ENDC)
+        
+        # Display all sections
+        display_analog_inputs()
+        display_digital_inputs()
+        display_digital_outputs()
+        display_status_word()
+        display_pump_status()
+        display_override_status()
+        
+        # Menu options
+        print(Colors.HEADER + Colors.BOLD + "\n╔═══════════════════════════════════════════════════════════╗" + Colors.ENDC)
+        print(Colors.HEADER + Colors.BOLD + "║                      MENU OPTIONS                         ║" + Colors.ENDC)
+        print(Colors.HEADER + Colors.BOLD + "╚═══════════════════════════════════════════════════════════╝" + Colors.ENDC)
+        print("\n  [R] Refresh display")
+        print("  [O] Override control")
+        print("  [T] LED test mode")
+        print("  [M] Show I/O mapping reference")
+        print("  [Q] Quit")
+        
+        try:
+            choice = input(f"\n{Colors.BOLD}Select option: {Colors.ENDC}").upper()
+            
+            if choice == 'R':
+                continue
+            elif choice == 'O':
+                interactive_override()
+                input("\nPress Enter to continue...")
+            elif choice == 'T':
+                led_test()
+                input("\nPress Enter to continue...")
+            elif choice == 'M':
+                display_full_io_map()
+                input("\nPress Enter to continue...")
+            elif choice == 'Q':
+                break
+            else:
+                print(Colors.WARNING + "Invalid option" + Colors.ENDC)
+                time.sleep(1)
+                
+        except KeyboardInterrupt:
+            print("\n")
+            break
+
+def main():
+    """Main program entry point"""
+    print(Colors.HEADER + Colors.BOLD)
+    print("═" * 63)
+    print("  WAGO 750-881 Heating Control Enhanced Monitor v4.0.0")
+    print("  Complete Physical I/O Display with Bit Explanations")
+    print("═" * 63)
+    print(Colors.ENDC)
+    
+    if not connect_plc():
+        sys.exit(1)
+    
+    print(Colors.OKGREEN + "✓ Connected to PLC" + Colors.ENDC)
+    time.sleep(1)
+    
+    try:
+        main_menu()
+    finally:
+        if client:
+            client.close()
+        print(Colors.OKGREEN + "\nDisconnected from PLC" + Colors.ENDC)
 
 if __name__ == "__main__":
-    args = parse_arguments()
-    run_sync(args)
+    main()

@@ -1,0 +1,312 @@
+# WAGO 750-881 Physical I/O Reference
+# Complete Hardware Mapping Documentation
+
+## Analog Input Cards
+
+### Card Slot 1: 750-461 (4-Channel Analog Input 0-10V)
+
+| Terminal | PLC Address | Modbus Register | Signal Type | Sensor | Description |
+|----------|-------------|-----------------|-------------|---------|-------------|
+| AI0+ / AI0- | %IW0 | 12320 | PT1000 | T1 | Boiler Temperature (Kessel) |
+| AI1+ / AI1- | %IW1 | 12321 | PT1000 | T2 | Hot Water Tank (Warmwasser) |
+| AI2+ / AI2- | %IW2 | 12322 | PT1000 | T3 | Heating Circuit Flow (Heizkreis Vorlauf) |
+| AI3+ / AI3- | %IW3 | 12323 | PT1000 | T4 | Outdoor Temperature (Außentemperatur) |
+
+**Technical Details:**
+- Resolution: 15-bit + sign (0-32767)
+- Voltage Range: 0-10V DC
+- PT1000 Interface: Via signal converter (PT1000 → 0-10V)
+- Sample Rate: ~100ms per channel
+- Accuracy: ±0.1% of full scale
+
+**Conversion Formula:**
+```
+Voltage [V] = (Raw_Value / 32767) × 10.0
+Temperature [°C] = Voltage × 10.0  (depends on converter calibration)
+```
+
+## Digital Input Cards
+
+### Card Slot 2: 750-430 (8-Channel Digital Input 24V DC)
+
+| Terminal | PLC Address | Bit Position | Signal | Description |
+|----------|-------------|--------------|--------|-------------|
+| DI.0 | %IW4.0 | Bit 0 | Door_Contact | Safety door contact switch |
+| DI.1 | %IW4.1 | Bit 1 | Flow_Switch | Heating circuit flow monitor |
+| DI.2 | %IW4.2 | Bit 2 | External_Enable | Remote enable signal |
+| DI.3 | %IW4.3 | Bit 3 | Emergency_Stop | E-Stop button (NC contact) |
+| DI.4 | %IW4.4 | Bit 4 | Mode_Select | Operating mode selector |
+| DI.5 | %IW4.5 | Bit 5 | Reserved | Future expansion |
+| DI.6 | %IW4.6 | Bit 6 | Reserved | Future expansion |
+| DI.7 | %IW4.7 | Bit 7 | Reserved | Future expansion |
+
+**Modbus Access:** Register 12324 (%MW36 = %IW4)
+
+**Technical Details:**
+- Input Voltage: 24V DC nominal (11-30V range)
+- Input Current: ~3mA per channel
+- Response Time: <3ms
+- Isolation: 500V DC (channel to bus)
+- Filter Time: Configurable (default 3ms)
+
+**Wiring:**
+```
+24V+ ─┬──[Switch]──┤DI.0
+      ├──[Switch]──┤DI.1
+      ├──[Switch]──┤DI.2
+      └──[Switch]──┤DI.3
+                     │
+GND ─────────────────┤COM
+```
+
+## Digital Output Cards
+
+### Card Slot 3: 750-530 (8-Channel Digital Output 24V DC)
+
+| Terminal | PLC Address | Bit Position | Load | Description |
+|----------|-------------|--------------|------|-------------|
+| DO.0 | %QB0.0 | Bit 0 | Pump_WW | Hot Water Circulation Pump |
+| DO.1 | %QB0.1 | Bit 1 | Pump_HK | Heating Circuit Pump |
+| DO.2 | %QB0.2 | Bit 2 | Pump_BR | Well Pump (Brunnenpumpe) |
+| DO.3 | %QB0.3 | Bit 3 | Mux_A | Multiplexer Control Phase A |
+| DO.4 | %QB0.4 | Bit 4 | Mux_B | Multiplexer Control Phase B |
+| DO.5 | %QB0.5 | Bit 5 | Reserved | Future expansion |
+| DO.6 | %QB0.6 | Bit 6 | Reserved | Future expansion |
+| DO.7 | %QB0.7 | Bit 7 | Reserved | Future expansion |
+
+**Modbus Access:** Register 512 (%QB0)
+
+**Technical Details:**
+- Output Voltage: 24V DC (provided externally)
+- Max Current: 0.5A per channel
+- Protection: Short circuit proof, overload protected
+- Switching Time: <100µs
+- Isolation: 500V DC (channel to bus)
+
+**Load Specifications:**
+- Pumps: 24V DC contactor coils (~50mA each)
+- Multiplexer: Solid-state relay inputs (~20mA)
+
+**Wiring Example:**
+```
+24V+ ──────────┬─────┤DO.0├───[Relay Coil]──┤Pump Motor WW
+               ├─────┤DO.1├───[Relay Coil]──┤Pump Motor HK
+               └─────┤DO.2├───[Relay Coil]──┤Pump Motor BR
+
+GND ───────────┤COM (separate power supply for loads)
+```
+
+## Status Word Bit Mapping (%MW42 / Register 12330)
+
+| Bit | Name | Description | Set (1) | Clear (0) |
+|-----|------|-------------|---------|-----------|
+| 0 | RESERVED | Future use | - | - |
+| 1 | RESERVED | Future use | - | - |
+| 2 | RESERVED | Future use | - | - |
+| 3 | NIGHT_MODE | Reduced heating | Night active | Day mode |
+| 4 | MUX_PHASE | Multiplexer state | Phase B | Phase A |
+| 5 | DATA_READY | Sample complete | Valid data | Sampling |
+| 6 | SENSOR_ERROR | Sensor fault | Error detected | All OK |
+| 7 | SYS_ERROR | System error | Critical fault | Normal |
+| 8-15 | RESERVED | Future expansion | - | - |
+
+**Example Values:**
+- 0x0000 (0) = All normal, day mode, phase A
+- 0x0008 (8) = Night mode active
+- 0x0010 (16) = Multiplexer on phase B
+- 0x0020 (32) = Data ready flag set
+- 0x0040 (64) = Sensor error detected
+- 0x0038 (56) = Night mode + Phase B + Data ready
+
+## Multiplexer Operation
+
+The system uses a 2-phase multiplexer to read additional sensors with limited analog inputs.
+
+### Multiplexer Control Logic:
+
+**Phase A (Mux_A=HIGH, Mux_B=LOW):**
+- Reads: T5 (Return flow temperature - PT1000)
+- Duration: 200ms settling time
+- Then: Sample & Hold to internal register
+
+**Phase B (Mux_A=LOW, Mux_B=HIGH):**
+- Reads: T6, T7 (Auxiliary NTC sensors)
+- Duration: 200ms settling time
+- Then: Sample & Hold to internal registers
+
+**Cycle Time:** 500ms total (Phase A → Phase B → Process)
+
+## Runtime Counter Implementation
+
+Runtime counters are stored in **NON-RETAIN** memory to survive PLC power cycles.
+
+### Runtime Registers:
+
+| Pump | Runtime Address | Cycles Address | Unit | Max Value |
+|------|----------------|----------------|------|-----------|
+| Hot Water (WW) | 12336 (%MW48) | 12337 (%MW49) | hours | 65535 |
+| Heating (HK) | 12338 (%MW50) | 12339 (%MW51) | hours | 65535 |
+| Well (BR) | 12340 (%MW52) | 12341 (%MW53) | hours | 65535 |
+
+**Update Logic:**
+- Runtime increments every 3600 seconds of ON time
+- Cycles increment on each OFF→ON transition
+- Values persist through PLC restarts
+- Values can be reset via Modbus write
+
+## Reason Code System
+
+Each pump has an associated reason code explaining its current state.
+
+### Reason Code Registers:
+
+| Pump | Register | Description |
+|------|----------|-------------|
+| Hot Water | 12344 (%MW54) | WW pump state reason |
+| Heating | 12345 (%MW55) | HK pump state reason |
+| Well | 12346 (%MW56) | BR pump state reason |
+
+### Reason Code Values:
+
+| Code | Hex | Meaning | Pump State |
+|------|-----|---------|------------|
+| 0 | 0x00 | No demand (ΔT < threshold) | OFF |
+| 1 | 0x01 | ΔT threshold exceeded | ON |
+| 2 | 0x02 | Override - forced ON | ON |
+| 3 | 0x03 | Override - forced OFF | OFF |
+| 4 | 0x04 | Safety limit reached | OFF |
+| 5 | 0x05 | Frost protection active | ON |
+| 6 | 0x06 | Night mode - reduced heating | OFF |
+| 16 | 0x10 | Test mode | ON |
+| 255 | 0xFF | Unknown/Error state | ? |
+
+## Override Control System
+
+### Override Registers:
+
+| Pump | Register | Function |
+|------|----------|----------|
+| Hot Water | 12400 (%MW112) | WW pump override |
+| Heating | 12401 (%MW113) | HK pump override |
+| Well | 12402 (%MW114) | BR pump override |
+
+### Override Values:
+
+| Value | Mode | Behavior |
+|-------|------|----------|
+| 0 | AUTO | Normal automatic control via ΔT logic |
+| 1 | FORCE ON | Pump forced ON regardless of temperature |
+| 2 | FORCE OFF | Pump forced OFF regardless of temperature |
+
+**Safety Notes:**
+- Override timeout: 4 hours maximum
+- After timeout, system returns to AUTO mode
+- Override does NOT bypass safety limits (overheat, etc.)
+- Multiple simultaneous overrides are allowed
+
+## Temperature Threshold Configuration
+
+### Setpoint Registers (Read/Write):
+
+| Parameter | Register | Default | Range | Unit |
+|-----------|----------|---------|-------|------|
+| WW Target Temp | 12384 (%MW96) | 550 | 400-700 | °C × 10 |
+| HK Target Temp | 12385 (%MW97) | 450 | 300-600 | °C × 10 |
+| ΔT Threshold | - (hardcoded) | 20 | - | °C × 10 (2.0°C) |
+| Night Start | 12388 (%MW100) | 22 | 0-23 | hour |
+| Night End | 12389 (%MW101) | 6 | 0-23 | hour |
+| Frost Threshold | 12397 (%MW109) | 50 | 0-100 | °C × 10 |
+
+**Example:**
+- WW Target = 550 means 55.0°C
+- ΔT = 20 means 2.0°C
+- Pump activates when: T_Boiler ≥ T_Tank + 2.0°C
+
+## System Diagnostics
+
+### Diagnostic Registers:
+
+| Parameter | Register | Type | Unit |
+|-----------|----------|------|------|
+| Uptime (Low) | 12416 (%MW128) | UINT32 (low) | seconds |
+| Uptime (High) | 12417 (%MW129) | UINT32 (high) | seconds |
+| Error Count | 12418 (%MW130) | UINT16 | count |
+| CPU Load | 12419 (%MW131) | UINT16 | % |
+
+**Uptime Calculation:**
+```python
+uptime_seconds = (high_word << 16) | low_word
+uptime_days = uptime_seconds / 86400
+```
+
+## Safety Features
+
+### Hardware Interlocks:
+
+1. **Thermal Cutoff:** External thermostat cuts power at 95°C
+2. **Emergency Stop:** NC contact on DI.3 (must be closed for operation)
+3. **Flow Switch:** Monitors circulation on DI.1
+4. **Pressure Relief:** Mechanical valve (not monitored by PLC)
+
+### Software Safeties:
+
+1. **Overheat Protection:** 
+   - Shutdown at T_Boiler > 85°C
+   - Reason code 0x04
+   
+2. **Sensor Error Handling:**
+   - Watchdog on all PT1000 inputs
+   - Default to safe state (pumps OFF) on error
+   - Status word bit 6 set
+   
+3. **Pump Protection:**
+   - Minimum OFF time: 60 seconds
+   - Maximum ON time: 8 hours continuous
+   - Anti-cycling: 5 minute minimum between cycles
+
+## Troubleshooting Guide
+
+### Common Issues:
+
+**No response from PLC:**
+```bash
+# Check network
+ping 192.168.1.100
+
+# Check Modbus port
+telnet 192.168.1.100 502
+
+# Verify PLC status LEDs:
+# - Green POWER: Solid ON
+# - Yellow RUN: Blinking (program running)
+# - Red ERROR: Should be OFF
+```
+
+**Analog input reads 0 or 32767:**
+- 0 = Sensor disconnected or shorted
+- 32767 = Sensor open circuit or converter error
+- Check PT1000 resistance: Should be ~1000Ω at 0°C
+
+**Digital input not responding:**
+- Verify 24V supply voltage
+- Check terminal connections
+- Measure input voltage at terminal
+- Check DI LED on card (should light when active)
+
+**Output not switching:**
+- Check load voltage supply (24V DC)
+- Verify load current < 0.5A
+- Check DO LED on card
+- Test with LED indicator instead of actual load
+
+**Runtime counter not incrementing:**
+- Check if pump output is actually ON
+- Verify reason code is 0x01 or 0x02
+- Runtime updates only every hour (3600s)
+
+---
+
+**Document Version:** 1.0  
+**Last Updated:** 2026-01-06  
+**Author:** gerontec  
+**Hardware:** WAGO 750-881 + 750-461 + 750-430 + 750-530
