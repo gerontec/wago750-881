@@ -1,461 +1,228 @@
 #!/usr/bin/python3
-# -*- coding: utf-8 -*-
-"""
-================================================================================
-HEIZUNGSSTEUERUNG - DATENLOGGER (heizung2.py)
-================================================================================
-VERSION: 3.9.0
-DATUM: 02.01.2026 08:00:00
-ÄNDERUNGEN: 
-- NEU: Runtime-Anzeige aus OSCAT ACTUATOR_PUMP (MW32+24,25,26)
-- NEU: Grafische DO-Anzeige (wie DI-Zeile)
-- UPDATE: Reason Bytes verschoben auf MW32+30,31,32 (nach Seriennummer)
-- UPDATE: Unterstützung für v6.4.8 (ΔT ≥ 2.0°C Regel)
-- FIX: Physische Ausgänge aus %QB0 (Modbus 512)
-================================================================================
-"""
-import sys
-import pandas as pd
+# heizung2.py v4.3.0 - MIT INVERTIERTEN RELAIS & WASSERTANK
+import pymysql, sys, pandas as pd
 from datetime import datetime
 from pymodbus.client import ModbusTcpClient
-from sqlalchemy import create_engine, text
 import paho.mqtt.client as mqtt
 import time
-import struct
+from sqlalchemy import create_engine, text
 
-# --- KONFIGURATION ---
-SPS_IP = '192.168.178.2'
-MQTT_BROKER = 'localhost'
-MQTT_TOPIC = 'Node3/pin4'
-MQTT_TIMEOUT = 5
-DB_URL = 'mysql+pymysql://gh:a12345@10.8.0.1/wagodb?charset=utf8mb4'
-SCHEMA_VERSION = 7  # Version erhöht für Runtime
+# =============================================================================
+# WAGO 750-881 MODBUS REGISTER MAP
+# =============================================================================
+# WICHTIG: Modbus-Adresse = CODESYS MW-Nummer + 12288
+#
+# INPUTS (von SPS gelesen):
+# MW0    = 12288  = Stunden-Setpoint (von Python geschrieben)
+# MW32   = 12320  = xMeasure[1]  - Sensor Vorlauf (Raw)
+# MW33   = 12321  = xMeasure[2]  - Sensor Außen (Raw)
+# ...
+# MW95   = 12383  = xMeasure[64] - Letztes Measure-Register
+#
+# SETPOINTS (von Python geschrieben, von SPS gelesen):
+# MW96   = 12384  = xSetpoints[1]
+# MW107  = 12395  = xSetpoints[12]
+# MW108  = 12396  = xSetpoints[13] - R290 Wassertank-Temperatur (*100)
+# MW109  = 12397  = xSetpoints[14] - WW Pumpen-Override (-1/0/1)
+# MW110  = 12398  = xSetpoints[15] - HK Pumpen-Override (-1/0/1)
+# MW111  = 12399  = xSetpoints[16] - BR Pumpen-Override (-1/0/1)
+#
+# PHYSICAL OUTPUTS (von SPS gelesen):
+# %QB0   = 512    = Physical Output Byte (Relais-Status)
+#
+# SYSTEM (von SPS gelesen):
+# MW128  = 12416  = xSystem[1] - Uptime Low-Word
+# MW129  = 12417  = xSystem[2] - Uptime High-Word
+# ...
+# =============================================================================
 
-# Modbus-Adressen (NEUE POSITIONEN nach v6.4.8!)
-ADDR_REASON_WW = 12348  # xNewVar70[30]
-ADDR_REASON_HK = 12350  # xNewVar70[31]
-ADDR_REASON_BR = 12352  # xNewVar70[32]
-ADDR_RUNTIME_WW = 12336  # xNewVar70[24] - Runtime in 0.01h
-ADDR_RUNTIME_HK = 12338  # xNewVar70[25]
-ADDR_RUNTIME_BR = 12340  # xNewVar70[26]
-ADDR_CYCLES_WW = 12342   # xNewVar70[27]
-ADDR_CYCLES_HK = 12344   # xNewVar70[28]
-ADDR_CYCLES_BR = 12346   # xNewVar70[29]
-ADDR_QB0 = 512           # Physische Ausgänge %QB0
+SPS_IP, DB_URL = '192.168.178.2', 'mysql+pymysql://gh:a12345@10.8.0.1/wagodb'
+mqtt_val, mqtt_rx = None, False
 
-# Globale MQTT-Variable
-mqtt_temp = None
-mqtt_received = False
-
-def on_message(client, userdata, msg):
-    global mqtt_temp, mqtt_received
-    try:
-        mqtt_temp = float(msg.payload.decode())
-        mqtt_received = True
-    except:
-        mqtt_temp = None
+def on_msg(c, u, m):
+    global mqtt_val, mqtt_rx
+    try: mqtt_val, mqtt_rx = float(m.payload.decode()), True
+    except: pass
 
 def get_mqtt():
-    global mqtt_temp, mqtt_received
-    mqtt_temp, mqtt_received = None, False
+    global mqtt_val, mqtt_rx
+    mqtt_val, mqtt_rx = None, False
     try:
-        client = mqtt.Client()
-        client.on_message = on_message
-        client.connect(MQTT_BROKER, 1883, 60)
-        client.subscribe(MQTT_TOPIC)
-        start = time.time()
-        client.loop_start()
-        while not mqtt_received and (time.time() - start) < MQTT_TIMEOUT:
-            time.sleep(0.1)
-        client.loop_stop()
-        client.disconnect()
-        return mqtt_temp if mqtt_received else None
-    except:
-        return None
+        c = mqtt.Client(); c.on_message = on_msg; c.connect('localhost', 1883, 60)
+        c.subscribe('Node3/pin4'); st = time.time(); c.loop_start()
+        while not mqtt_rx and time.time()-st < 5: time.sleep(0.1)
+        c.loop_stop(); c.disconnect()
+        return mqtt_val if mqtt_rx else None
+    except: return None
 
-# Sensor-Formeln
-calc_pt1000 = lambda r: round((r - 7134) / 25, 2) if 4000 < r < 25000 else 0.0
-calc_boiler = lambda r: round((40536 - r) / 303.1, 2) if 4000 < r < 45000 else 0.0
-calc_solar = lambda r: round((r - 26402) / 60, 2) if 4000 < r < 40000 else 0.0
+calc_pt = lambda r: round((r-7134)/25, 2) if 4000<r<25000 else 0.0
+calc_bo = lambda r: round((40536-r)/303.1, 2) if 4000<r<45000 else 0.0
+calc_so = lambda r: round((r-26402)/60, 2) if 4000<r<40000 else 0.0
+to_u = lambda v: v if v>=0 else v+65536
+to_s = lambda v: v if v<32768 else v-65536
 
-def get_dint(registers, index):
-    """Extrahiert DINT aus Register-Array (LOW, HIGH)"""
-    low = registers[index * 2]
-    high = registers[index * 2 + 1]
-    value = (high << 16) | low
-    return value - 0x100000000 if value >= 0x80000000 else value
+def dec_rea(r, t):
+    if r==0: return "AUS"
+    if t=='WW': return "ΔT≥2°C" if r&1 else ""
+    if t=='HK': return "+".join([x for b,x in [(1,"Frost"),(2,"Wärme"),(4,"Ovr")] if r&b])
+    return "HK aktiv" if r&1 else ""
 
-def sanitize_reason_byte(value):
-    """Bereinigt Reason-Byte Werte für TINYINT UNSIGNED (0-255)"""
-    if value < 0:
-        return value & 0xFF
-    elif value > 255:
-        return value & 0xFF
-    else:
-        return value
+def fmt_rt(sec):
+    """Formatiert Runtime aus Sekunden in Tage, Stunden, Minuten"""
+    d = sec // 86400
+    h = (sec % 86400) // 3600
+    m = (sec % 3600) // 60
+    return f"{d}d {h:02d}h {m:02d}m"
 
-def read_reason_bytes(client):
-    """Liest alle drei Reason Bytes - NEUE ADRESSEN!"""
-    try:
-        result = client.read_holding_registers(ADDR_REASON_WW, 6, slave=0)
-        if not result.isError():
-            ww = sanitize_reason_byte(get_dint(result.registers, 0))
-            hk = sanitize_reason_byte(get_dint(result.registers, 1))
-            br = sanitize_reason_byte(get_dint(result.registers, 2))
-            return (ww, hk, br)
-    except Exception as e:
-        print(f"⚠ Reason Bytes Lesefehler: {e}")
-    return (0, 0, 0)
-
-def read_pump_runtime(client):
-    """Liest Runtime und Cycles aus OSCAT ACTUATOR_PUMP"""
-    try:
-        result = client.read_holding_registers(ADDR_RUNTIME_WW, 12, slave=0)
-        if not result.isError():
-            ww_runtime_01h = get_dint(result.registers, 0)
-            hk_runtime_01h = get_dint(result.registers, 1)
-            br_runtime_01h = get_dint(result.registers, 2)
-            ww_cycles = get_dint(result.registers, 3)
-            hk_cycles = get_dint(result.registers, 4)
-            br_cycles = get_dint(result.registers, 5)
-            
-            return {
-                'ww_hours': ww_runtime_01h / 100.0,
-                'hk_hours': hk_runtime_01h / 100.0,
-                'br_hours': br_runtime_01h / 100.0,
-                'ww_cycles': ww_cycles,
-                'hk_cycles': hk_cycles,
-                'br_cycles': br_cycles
-            }
-    except Exception as e:
-        print(f"⚠ Runtime Lesefehler: {e}")
-    return None
-
-def read_physical_outputs(client):
-    """Liest physische Ausgänge aus %QB0 (Adresse 512)"""
-    try:
-        result = client.read_holding_registers(ADDR_QB0, 1, slave=0)
-        if not result.isError():
-            output_byte = result.registers[0] & 0xFF
-            return {
-                'ww': bool(output_byte & 0x02),  # Bit 1
-                'hk': bool(output_byte & 0x04),  # Bit 2
-                'br': bool(output_byte & 0x08),  # Bit 3
-                'qb0': output_byte
-            }
-    except Exception as e:
-        print(f"⚠ Physische Ausgänge Lesefehler: {e}")
-    return None
-
-def decode_reason_ww(r):
-    """WW-Pumpe: v6.4.8 vereinfacht - nur ΔT ≥ 2.0°C"""
-    KNOWN_BITS = 0x01
-    if r & ~KNOWN_BITS:
-        return "ACTUATOR"
-    if r & 0x01:
-        return "ΔT≥2°C"
-    return "ΔT<2°C"
-
-def decode_reason_hk(r):
-    """HK-Pumpe: Bitweise"""
-    KNOWN_BITS = 0x07
-    if r & ~KNOWN_BITS:
-        return "ACTUATOR"
-    if r == 0:
-        return "Aus"
-    parts = []
-    if r & 0x01:
-        parts.append("Frost")
-    if r & 0x02:
-        parts.append("Wärme")
-    if r & 0x04:
-        parts.append("Override")
-    return "+".join(parts)
-
-def decode_reason_br(r):
-    """Brunnenpumpe: Bit 0 = HK aktiv"""
-    KNOWN_BITS = 0x01
-    if r & ~KNOWN_BITS:
-        return "ACTUATOR"
-    return "HK aktiv" if r & 0x01 else "HK inaktiv"
-
-def decode_di8_word(di_word):
-    """Dekodiert das 16-Bit Word der 8-Kanal DI-Karte"""
-    return {
-        'di_0': bool(di_word & 0x01),
-        'di_1': bool(di_word & 0x02),
-        'di_2': bool(di_word & 0x04),
-        'di_3': bool(di_word & 0x08),
-        'di_4': bool(di_word & 0x10),
-        'di_5': bool(di_word & 0x20),
-        'di_6': bool(di_word & 0x40),
-        'di_7': bool(di_word & 0x80),
-        'raw_value': di_word
-    }
-
-def format_runtime(hours):
-    """Formatiert Runtime in Tagen und Stunden"""
-    total_hours = int(hours)
-    days = total_hours // 24
-    hrs = total_hours % 24
-    return f"{days}d {hrs:02d}h"
-
-def read_di8_card(client):
-    """Liest die 8-Kanal Digital-Input-Karte (Input Register 4)"""
-    try:
-        result = client.read_input_registers(4, 1, slave=0)
-        if not result.isError():
-            return result.registers[0]
-    except Exception as e:
-        print(f"⚠ DI-8-Karte Lesefehler: {e}")
-    return None
-
-def ensure_schema(engine):
-    """Erstellt/aktualisiert Datenbank-Schema"""
-    with engine.begin() as conn:
-        # Prüfe ob schema_version Tabelle existiert
-        table_exists = conn.execute(text("""
-            SELECT COUNT(*) FROM information_schema.tables 
-            WHERE table_schema='wagodb' AND table_name='schema_version'
-        """)).scalar()
-        
-        # Versions-Tabelle erstellen falls nicht vorhanden
-        if not table_exists:
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS schema_version (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    version INT NOT NULL,
-                    applied_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    description VARCHAR(255),
-                    INDEX idx_version (version)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """))
-            current_version = 0
+def ensure_schema(eng):
+    with eng.begin() as c:
+        ex = c.execute(text("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='wagodb' AND table_name='schema_version'")).scalar()
+        if not ex:
+            c.execute(text("CREATE TABLE schema_version(id INT AUTO_INCREMENT PRIMARY KEY, version INT, applied_at DATETIME DEFAULT CURRENT_TIMESTAMP, description VARCHAR(255))"))
+            cv = 0
         else:
-            current_version = conn.execute(text("""
-                SELECT COALESCE(MAX(version), 0) FROM schema_version
-            """)).scalar()
+            cv = c.execute(text("SELECT COALESCE(MAX(version),0) FROM schema_version")).scalar()
         
-        if current_version >= SCHEMA_VERSION:
-            print(f"✓ Schema aktuell (V{current_version})")
-            return
+        # Schema-Version 8: VARCHAR version
+        if cv < 8:
+            tbl_ex = c.execute(text("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='wagodb' AND table_name='heizung'")).scalar()
+            
+            if tbl_ex:
+                c.execute(text("ALTER TABLE heizung MODIFY COLUMN version VARCHAR(20) DEFAULT '1.2.0'"))
+                c.execute(text("INSERT INTO schema_version(version,description) VALUES(8,'VARCHAR version column')"))
+            else:
+                c.execute(text("""CREATE TABLE heizung(
+                    id INT AUTO_INCREMENT PRIMARY KEY, 
+                    version VARCHAR(20) DEFAULT '1.2.0',
+                    sensor_gruppe CHAR(1) DEFAULT 'B', 
+                    zeitstempel DATETIME NOT NULL, 
+                    stunde TINYINT,
+                    zaehler_kwh INT UNSIGNED DEFAULT 0, 
+                    zaehler_pumpe INT UNSIGNED DEFAULT 0, 
+                    zaehler_brunnen INT UNSIGNED DEFAULT 0,
+                    raw_vorlauf SMALLINT UNSIGNED, 
+                    raw_aussen SMALLINT UNSIGNED, 
+                    raw_innen SMALLINT UNSIGNED, 
+                    raw_kessel SMALLINT UNSIGNED,
+                    temp_vorlauf DECIMAL(5,2), 
+                    temp_aussen DECIMAL(5,2), 
+                    temp_innen DECIMAL(5,2), 
+                    temp_kessel DECIMAL(5,2),
+                    raw_warmwasser SMALLINT UNSIGNED, 
+                    temp_warmwasser DECIMAL(5,2), 
+                    wert_oeltank DECIMAL(7,2),
+                    raw_ruecklauf SMALLINT UNSIGNED, 
+                    temp_ruecklauf DECIMAL(5,2), 
+                    raw_solar SMALLINT UNSIGNED, 
+                    temp_solar DECIMAL(5,2),
+                    ky9a DECIMAL(5,2), 
+                    status_word SMALLINT UNSIGNED, 
+                    di8_raw SMALLINT UNSIGNED,
+                    reason_ww TINYINT UNSIGNED DEFAULT 0, 
+                    reason_hk TINYINT UNSIGNED DEFAULT 0, 
+                    reason_br TINYINT UNSIGNED DEFAULT 0,
+                    runtime_ww_h DECIMAL(6,2) DEFAULT 0, 
+                    runtime_hk_h DECIMAL(6,2) DEFAULT 0, 
+                    runtime_br_h DECIMAL(6,2) DEFAULT 0,
+                    cycles_ww INT UNSIGNED DEFAULT 0, 
+                    cycles_hk INT UNSIGNED DEFAULT 0, 
+                    cycles_br INT UNSIGNED DEFAULT 0,
+                    INDEX(zeitstempel), INDEX(stunde))"""))
+                c.execute(text("INSERT INTO schema_version(version,description) VALUES(8,'INT v4.2 with VARCHAR version')"))
         
-        print(f"→ Schema-Update V{current_version} → V{SCHEMA_VERSION}")
-        
-        # Haupt-Tabelle erstellen/erweitern
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS heizung (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                version DECIMAL(3,1) NOT NULL DEFAULT 1.2,
-                sensor_gruppe CHAR(1) NOT NULL DEFAULT 'B',
-                zeitstempel DATETIME NOT NULL,
-                stunde TINYINT NOT NULL,
-                zaehler_kwh INT UNSIGNED NOT NULL DEFAULT 0,
-                zaehler_pumpe INT UNSIGNED NOT NULL DEFAULT 0,
-                zaehler_brunnen INT UNSIGNED NOT NULL DEFAULT 0,
-                raw_vorlauf SMALLINT UNSIGNED NOT NULL,
-                raw_aussen SMALLINT UNSIGNED NOT NULL,
-                raw_innen SMALLINT UNSIGNED NOT NULL,
-                raw_kessel SMALLINT UNSIGNED NOT NULL,
-                temp_vorlauf DECIMAL(5,2) NOT NULL,
-                temp_aussen DECIMAL(5,2) NOT NULL,
-                temp_innen DECIMAL(5,2) NOT NULL,
-                temp_kessel DECIMAL(5,2) NOT NULL,
-                raw_warmwasser SMALLINT UNSIGNED NOT NULL,
-                temp_warmwasser DECIMAL(5,2) NOT NULL,
-                wert_oeltank DECIMAL(7,2) NOT NULL,
-                raw_ruecklauf SMALLINT UNSIGNED NOT NULL,
-                temp_ruecklauf DECIMAL(5,2) NOT NULL,
-                raw_solar SMALLINT UNSIGNED NOT NULL,
-                temp_solar DECIMAL(5,2) NOT NULL,
-                ky9a DECIMAL(5,2) DEFAULT NULL,
-                status_word SMALLINT UNSIGNED NOT NULL,
-                INDEX idx_zeitstempel (zeitstempel),
-                INDEX idx_stunde (stunde)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """))
-        
-        # Spalte ky9a hinzufügen falls nicht vorhanden (V4)
-        if current_version < 4:
-            try:
-                conn.execute(text("""
-                    ALTER TABLE heizung ADD COLUMN ky9a DECIMAL(5,2) DEFAULT NULL 
-                    COMMENT 'MQTT Node3/pin4' AFTER temp_solar
-                """))
-                print("  ✓ Spalte ky9a hinzugefügt")
-            except Exception as e:
-                if "Duplicate column" not in str(e):
-                    print(f"  ⚠ ky9a: {e}")
-        
-        # Spalte di8_raw hinzufügen falls nicht vorhanden (V5)
-        if current_version < 5:
-            try:
-                conn.execute(text("""
-                    ALTER TABLE heizung ADD COLUMN di8_raw SMALLINT UNSIGNED DEFAULT NULL 
-                    COMMENT '8-Kanal DI-Karte Raw-Wert' AFTER status_word
-                """))
-                print("  ✓ Spalte di8_raw hinzugefügt")
-            except Exception as e:
-                if "Duplicate column" not in str(e):
-                    print(f"  ⚠ di8_raw: {e}")
-        
-        # Reason Bytes hinzufügen (V6)
-        if current_version < 6:
-            try:
-                conn.execute(text("""
-                    ALTER TABLE heizung 
-                    ADD COLUMN reason_ww TINYINT UNSIGNED DEFAULT 0 COMMENT 'WW-Pumpe Reason' AFTER di8_raw,
-                    ADD COLUMN reason_hk TINYINT UNSIGNED DEFAULT 0 COMMENT 'HK-Pumpe Reason' AFTER reason_ww,
-                    ADD COLUMN reason_br TINYINT UNSIGNED DEFAULT 0 COMMENT 'Brunnenpumpe Reason' AFTER reason_hk
-                """))
-                print("  ✓ Spalten reason_ww, reason_hk, reason_br hinzugefügt")
-            except Exception as e:
-                if "Duplicate column" not in str(e):
-                    print(f"  ⚠ Reason Bytes: {e}")
-        
-        # Runtime Spalten hinzufügen (V7)
-        if current_version < 7:
-            try:
-                conn.execute(text("""
-                    ALTER TABLE heizung 
-                    ADD COLUMN runtime_ww_h DECIMAL(6,2) DEFAULT 0 COMMENT 'WW Runtime Stunden' AFTER reason_br,
-                    ADD COLUMN runtime_hk_h DECIMAL(6,2) DEFAULT 0 COMMENT 'HK Runtime Stunden' AFTER runtime_ww_h,
-                    ADD COLUMN runtime_br_h DECIMAL(6,2) DEFAULT 0 COMMENT 'BR Runtime Stunden' AFTER runtime_hk_h,
-                    ADD COLUMN cycles_ww INT UNSIGNED DEFAULT 0 COMMENT 'WW Zyklen' AFTER runtime_br_h,
-                    ADD COLUMN cycles_hk INT UNSIGNED DEFAULT 0 COMMENT 'HK Zyklen' AFTER cycles_ww,
-                    ADD COLUMN cycles_br INT UNSIGNED DEFAULT 0 COMMENT 'BR Zyklen' AFTER cycles_hk
-                """))
-                print("  ✓ Spalten runtime_*_h und cycles_* hinzugefügt")
-            except Exception as e:
-                if "Duplicate column" not in str(e):
-                    print(f"  ⚠ Runtime: {e}")
-        
-        # Version speichern
-        conn.execute(text("""
-            INSERT INTO schema_version (version, description) 
-            VALUES (:v, :desc)
-        """), {'v': SCHEMA_VERSION, 'desc': f'Auto-Update auf V{SCHEMA_VERSION} mit Runtime'})
-        
-        print(f"✓ Schema-Update abgeschlossen (V{SCHEMA_VERSION})")
+        # Schema-Version 9: Wassertank-Temperatur Spalte
+        if cv < 9:
+            tbl_ex = c.execute(text("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='wagodb' AND table_name='heizung'")).scalar()
+            if tbl_ex:
+                # Prüfe ob Spalte bereits existiert
+                col_ex = c.execute(text("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='wagodb' AND table_name='heizung' AND column_name='temp_wassertank'")).scalar()
+                if not col_ex:
+                    c.execute(text("ALTER TABLE heizung ADD COLUMN temp_wassertank DECIMAL(5,2) DEFAULT NULL COMMENT 'R290 Wassertank-Temperatur'"))
+                    c.execute(text("INSERT INTO schema_version(version,description) VALUES(9,'Added R290 tank temperature column')"))
 
-def run_sync():
-    now = datetime.now()
-    mqtt_val = get_mqtt()
-    
-    # Datenbank vorbereiten
-    engine = create_engine(DB_URL, pool_pre_ping=True)
-    ensure_schema(engine)
-    
-    # Modbus-Kommunikation
-    client = ModbusTcpClient(SPS_IP, port=502, timeout=5)
-    if not client.connect():
-        print("✗ SPS-Verbindung fehlgeschlagen")
-        sys.exit(1)
-    
-    try:
-        # Reason Bytes lesen
-        reason_ww, reason_hk, reason_br = read_reason_bytes(client)
-        
-        # Runtime lesen
-        runtime = read_pump_runtime(client)
-        
-        # Physische Ausgänge lesen
-        physical_out = read_physical_outputs(client)
-        
-        # DI-8-Karte lesen
-        di8_raw = read_di8_card(client)
-        if di8_raw is not None:
-            di8_data = decode_di8_word(di8_raw)
-            di_status = " ".join([f"DI{i}:{'■' if di8_data[f'di_{i}'] else '□'}" for i in range(8)])
-        
-        # DO-Status formatieren
-        if physical_out:
-            do_status = " ".join([
-                f"DO0:{'■' if physical_out['qb0'] & 0x01 else '□'}",
-                f"DO1(WW):{'■' if physical_out['ww'] else '□'}",
-                f"DO2(HK):{'■' if physical_out['hk'] else '□'}",
-                f"DO3(BR):{'■' if physical_out['br'] else '□'}",
-                f"DO4:□",
-                f"DO5:{'■' if physical_out['qb0'] & 0x20 else '□'}"
-            ])
-        
-        client.write_register(12288, now.hour, slave=0)
-        result = client.read_holding_registers(12320, 32, slave=0)
-        if result.isError():
-            return
-        
-        reg = result.registers
-        get_val = lambda i: max(reg[i*2], reg[i*2+1])
-        
-        # Daten sammeln
-        data = {
-            'version': 1.2,
-            'sensor_gruppe': 'A' if get_val(14) & 0x10 else 'B',
-            'zeitstempel': now,
-            'stunde': now.hour,
-            'zaehler_kwh': get_val(0),
-            'zaehler_pumpe': get_val(1),
-            'zaehler_brunnen': get_val(2),
-            'raw_vorlauf': (r_vl := get_val(4)),
-            'raw_aussen': (r_at := get_val(5)),
-            'raw_innen': (r_it := get_val(6)),
-            'raw_kessel': (r_ke := get_val(7)),
-            'temp_vorlauf': calc_pt1000(r_vl),
-            'temp_aussen': calc_pt1000(r_at),
-            'temp_innen': calc_pt1000(r_it),
-            'temp_kessel': calc_pt1000(r_ke),
-            'raw_warmwasser': (r_ww := get_val(8)),
-            'temp_warmwasser': calc_boiler(r_ww),
-            'wert_oeltank': float(get_val(9)),
-            'raw_ruecklauf': (r_ru := get_val(10)),
-            'temp_ruecklauf': calc_pt1000(r_ru),
-            'raw_solar': (r_so := get_val(11)),
-            'temp_solar': calc_solar(r_so),
-            'ky9a': mqtt_val,
-            'status_word': get_val(14),
-            'di8_raw': di8_raw,
-            'reason_ww': reason_ww,
-            'reason_hk': reason_hk,
-            'reason_br': reason_br,
-            'runtime_ww_h': runtime['ww_hours'] if runtime else 0,
-            'runtime_hk_h': runtime['hk_hours'] if runtime else 0,
-            'runtime_br_h': runtime['br_hours'] if runtime else 0,
-            'cycles_ww': runtime['ww_cycles'] if runtime else 0,
-            'cycles_hk': runtime['hk_cycles'] if runtime else 0,
-            'cycles_br': runtime['br_cycles'] if runtime else 0
-        }
-        
-        # Log
-        print("=" * 90)
-        print(f"HEIZUNGSSTEUERUNG v3.9.0 | SPS: v6.4.8")
-        print("=" * 90)
-        print(f"Zeit: {now:%Y-%m-%d %H:%M:%S} | WAGO 750-881 (Schema V{SCHEMA_VERSION})")
-        print(f"Zähler → kWh:{data['zaehler_kwh']} | Pumpe:{data['zaehler_pumpe']} | Brunnen:{data['zaehler_brunnen']}")
-        print(f"Gruppe A → VL:{data['temp_vorlauf']}°C | AT:{data['temp_aussen']}°C | IT:{data['temp_innen']}°C | KE:{data['temp_kessel']}°C")
-        print(f"Gruppe B → WW:{data['temp_warmwasser']}°C | Rück:{data['temp_ruecklauf']}°C | Solar:{data['temp_solar']}°C")
-        print(f"MQTT Node3 → {mqtt_val}°C" if mqtt_val else "MQTT Node3 → N/A")
-        if di8_raw is not None:
-            print(f"DI: {di_status}")
-        if physical_out:
-            print(f"DO: {do_status} | %QB0=0x{physical_out['qb0']:02X}")
-        print(f"Status → Phase:{data['sensor_gruppe']} | 0x{data['status_word']:04X}")
-        print(f"Pumpen → WW:{'AN' if physical_out and physical_out['ww'] else 'AUS'} | HK:{'AN' if physical_out and physical_out['hk'] else 'AUS'} | BR:{'AN' if physical_out and physical_out['br'] else 'AUS'}")
-        if runtime:
-            print(f"Runtime → WW:{format_runtime(runtime['ww_hours'])} ({runtime['ww_cycles']}×) | HK:{format_runtime(runtime['hk_hours'])} ({runtime['hk_cycles']}×) | BR:{format_runtime(runtime['br_hours'])} ({runtime['br_cycles']}×)")
-        print(f"Reason → WW:0x{reason_ww:02X} ({decode_reason_ww(reason_ww)}) | HK:0x{reason_hk:02X} ({decode_reason_hk(reason_hk)}) | BR:0x{reason_br:02X} ({decode_reason_br(reason_br)})")
-        print("=" * 90)
-        
-        # In DB schreiben
-        df = pd.DataFrame([data])
-        df.to_sql('heizung', engine, if_exists='append', index=False)
-        print("✓ Daten erfolgreich in DB gespeichert")
-        
-    except Exception as e:
-        print(f"✗ Fehler: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        client.close()
+now = datetime.now(); mqtt_t = get_mqtt(); eng = create_engine(DB_URL, pool_pre_ping=True)
+ensure_schema(eng); cl = ModbusTcpClient(SPS_IP, 502, timeout=5)
+if not cl.connect(): print("✗ SPS"); sys.exit(1)
 
-if __name__ == "__main__":
-    run_sync()
+try:
+    # Stunden-Setpoint schreiben (MW0 = 12288)
+    cl.write_register(12288, now.hour, 0)
+    
+    # Warte auf Data-Ready und lese Messwerte (MW32-MW95 = 12320-12383)
+    for _ in range(10):
+        r = cl.read_holding_registers(12320, 64, 0)  # xMeasure[1..64]
+        if not r.isError() and r.registers[10]&32: break
+        time.sleep(1.2)
+    else: print("✗ No ready"); sys.exit(1)
+    
+    reg = r.registers
+    rv,ra,ri,rk = to_u(reg[0]),to_u(reg[1]),to_u(reg[2]),to_u(reg[3])
+    rw,ro,ru,rs = to_u(reg[4]),to_u(reg[5]),to_u(reg[6]),to_u(reg[7])
+    sw,hr = to_s(reg[10]),to_s(reg[9])
+    di8 = to_u(reg[8])
+    
+    # Version dekodieren
+    ver_word = to_u(reg[15])
+    ver_major = (ver_word >> 8) & 0xFF
+    ver_minor = ver_word & 0xFF
+    ver_patch = to_s(reg[16])
+    sps_version = f"{ver_major}.{ver_minor}.{ver_patch}"
+    
+    # Runtime in SEKUNDEN
+    rtw_sec, rth_sec, rtb_sec = to_u(reg[18]), to_u(reg[19]), to_u(reg[20])
+    rtw_h, rth_h, rtb_h = rtw_sec / 3600.0, rth_sec / 3600.0, rtb_sec / 3600.0
+    
+    cyw,cyh,cyb = to_u(reg[21]), to_u(reg[22]), to_u(reg[23])
+    rww,rhk,rbr = to_u(reg[24])&255, to_u(reg[25])&255, to_u(reg[26])&255
+    
+    # Physical Output Byte (%QB0 = 512) - MIT INVERTIERTER LOGIK!
+    qb = cl.read_holding_registers(512,1,0)
+    qb0 = qb.registers[0]&255 if not qb.isError() else 0
+    
+    # Dekodiere Pumpen mit invertierter Relais-Logik
+    # Bit 1 (0x02): O1_WWPump     - FALSE = AN (invertiert!)
+    # Bit 2 (0x04): O2_UmwaelzHK1 - FALSE = AN (invertiert!)
+    # Bit 3 (0x08): O3_Brunnen    - TRUE  = AN (normal)
+    ww_pump = not bool(qb0 & 0x02)   # Invertiert!
+    hk_pump = not bool(qb0 & 0x04)   # Invertiert!
+    br_pump = bool(qb0 & 0x08)       # Normal
+    
+    # R290 Wassertank-Temperatur lesen (xSetpoints[13] = MW108 = 12396)
+    tank_result = cl.read_holding_registers(12396, 1, 0)
+    if not tank_result.isError():
+        tank_raw = to_s(tank_result.registers[0])
+        temp_tank = tank_raw / 100.0 if tank_raw != 0 else None
+    else:
+        temp_tank = None
+    
+    ph = 'A' if sw&16 else 'B'
+    data = {'version': sps_version, 'sensor_gruppe':ph, 'zeitstempel':now, 'stunde':now.hour,
+            'zaehler_kwh':0, 'zaehler_pumpe':0, 'zaehler_brunnen':0,
+            'raw_vorlauf':rv, 'raw_aussen':ra, 'raw_innen':ri, 'raw_kessel':rk,
+            'temp_vorlauf':calc_pt(rv), 'temp_aussen':calc_pt(ra), 'temp_innen':calc_pt(ri), 'temp_kessel':calc_pt(rk),
+            'raw_warmwasser':rw, 'temp_warmwasser':calc_bo(rw), 'wert_oeltank':float(ro),
+            'raw_ruecklauf':ru, 'temp_ruecklauf':calc_pt(ru), 'raw_solar':rs, 'temp_solar':calc_so(rs),
+            'ky9a':mqtt_t, 'status_word':sw, 'di8_raw':di8,
+            'reason_ww':rww, 'reason_hk':rhk, 'reason_br':rbr,
+            'runtime_ww_h':rtw_h, 'runtime_hk_h':rth_h, 'runtime_br_h':rtb_h,
+            'cycles_ww':cyw, 'cycles_hk':cyh, 'cycles_br':cyb,
+            'temp_wassertank': temp_tank}
+    
+    print("="*80)
+    print(f"HEIZUNG v4.3 | {now:%Y-%m-%d %H:%M:%S} | SPS v{sps_version} | Phase {ph}")
+    print(f"VL:{data['temp_vorlauf']:.1f}°C AT:{data['temp_aussen']:.1f}°C IT:{data['temp_innen']:.1f}°C KE:{data['temp_kessel']:.1f}°C")
+    print(f"WW:{data['temp_warmwasser']:.1f}°C RU:{data['temp_ruecklauf']:.1f}°C SO:{data['temp_solar']:.1f}°C")
+    if temp_tank: print(f"R290-Tank:{temp_tank:.1f}°C")
+    if mqtt_t: print(f"MQTT:{mqtt_t}°C")
+    print(f"Pumpen: WW={'AN' if ww_pump else 'AUS'} HK={'AN' if hk_pump else 'AUS'} BR={'AN' if br_pump else 'AUS'}")
+    print(f"Runtime: WW={fmt_rt(rtw_sec)}({cyw}×) HK={fmt_rt(rth_sec)}({cyh}×) BR={fmt_rt(rtb_sec)}({cyb}×)")
+    print(f"Reason: WW={dec_rea(rww,'WW')} HK={dec_rea(rhk,'HK')} BR={dec_rea(rbr,'BR')}")
+    print("="*80)
+    
+    pd.DataFrame([data]).to_sql('heizung', eng, if_exists='append', index=False)
+    print("✓ Gespeichert")
+except Exception as e:
+    print(f"✗ {e}")
+    import traceback; traceback.print_exc()
+finally:
+    cl.close()
