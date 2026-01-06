@@ -2,8 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-HEIZUNGSSTEUERUNG v4.4.0 - MIT BITMASKEN-DEKODIERUNG & NACHTABSENKUNG
+HEIZUNGSSTEUERUNG v4.5.0 - MIT OSCAT ZIELTEMPERATUR
 ================================================================================
+ÄNDERUNGEN v4.5.0:
+- OSCAT Vorlauf-Solltemperatur aus Heizkurve wird ausgelesen und angezeigt
+- Solltemperatur wird in DB gespeichert
+- Solltemperatur wird per MQTT publiziert (heizung/vorlauf_soll)
+
 ÄNDERUNGEN v4.4.0:
 - Nachtabsenkungszeiten über Command-Line konfigurierbar
 - Reason-Bytes werden als Bitmasken dekodiert (nicht mehr als einzelne Werte)
@@ -32,7 +37,7 @@ from pymodbus.client import ModbusTcpClient
 import paho.mqtt.client as mqtt
 import time
 
-VERSION = '4.4.0'
+VERSION = '4.5.0'
 
 # =============================================================================
 # KONFIGURATION
@@ -59,6 +64,7 @@ ADDR_SYSTEM = 12416       # xSystem[1..8] - MW128-MW135
 ADDR_ALARMS = 12432       # xAlarms[1..8] - MW144-MW151
 
 # Setpoint-Offsets (Array-Index - 1, da Array bei [1] startet)
+SETPOINT_VL_SOLL = 0        # xSetpoints[1] - OSCAT Vorlauf-Solltemperatur
 SETPOINT_NACHT_START = 4    # xSetpoints[5] - Nachtabsenkung Start (0-23)
 SETPOINT_NACHT_END = 5      # xSetpoints[6] - Nachtabsenkung Ende (0-23)
 SETPOINT_TANK_TEMP = 12     # xSetpoints[13] - R290 Wassertank
@@ -84,12 +90,12 @@ WW_REASON_TEMP_DIFF = 0x01    # Bit 0: ΔT≥2°C (temp_diff_ww >= 2.0)
 WW_REASON_OVERRIDE = 0x80     # Bit 7: Manueller Override (xSetpoints[14] > 0)
 
 # Heizkreis-Pumpe (bHK_Reason)
-HK_REASON_FROSTSCHUTZ = 0x01  # Bit 0: Außentemp < 3°C
-HK_REASON_WAERMEBEDARF = 0x02 # Bit 1: VL < Soll (temp_vorlauf < CONST_VL_SOLL_MIN)
+HK_REASON_FROSTSCHUTZ = 0x01  # Bit 0: Außentemp < Frostschutzgrenze (VERALTET)
+HK_REASON_WAERMEBEDARF = 0x02 # Bit 1: VL < Soll (temp_vorlauf < OSCAT Sollwert)
 HK_REASON_OVERRIDE = 0x80     # Bit 7: Manueller Override (xSetpoints[15] > 0)
 
 # Brunnenpumpe (bBR_Reason)
-BR_REASON_HK_ACTIVE = 0x01    # Bit 0: HK-Pumpe läuft (O2_UmwaelzHK1 = FALSE)
+BR_REASON_AUTO_ON = 0x01      # Bit 0: Automatikbetrieb - immer EIN
 BR_REASON_OVERRIDE = 0x80     # Bit 7: Manueller Override (xSetpoints[16] > 0)
 
 # =============================================================================
@@ -114,8 +120,6 @@ def decode_hk_reason(reason_byte):
         return "---"
     
     reasons = []
-    if reason_byte & HK_REASON_FROSTSCHUTZ:
-        reasons.append("Frost<3°C")
     if reason_byte & HK_REASON_WAERMEBEDARF:
         reasons.append("VL<Soll")
     if reason_byte & HK_REASON_OVERRIDE:
@@ -129,8 +133,8 @@ def decode_br_reason(reason_byte):
         return "---"
     
     reasons = []
-    if reason_byte & BR_REASON_HK_ACTIVE:
-        reasons.append("HK aktiv")
+    if reason_byte & BR_REASON_AUTO_ON:
+        reasons.append("Auto-On")
     if reason_byte & BR_REASON_OVERRIDE:
         reasons.append("Override")
     
@@ -205,6 +209,18 @@ def get_mqtt_temperature():
         print(f"✗ MQTT: {e}")
         return None
 
+def publish_mqtt(topic, value):
+    """Publiziert Wert zu MQTT Broker"""
+    try:
+        c = mqtt.Client()
+        c.connect(MQTT_BROKER, 1883, 60)
+        c.publish(topic, str(value), qos=1, retain=True)
+        c.disconnect()
+        return True
+    except Exception as e:
+        print(f"✗ MQTT publish failed: {e}")
+        return False
+
 # =============================================================================
 # STATUS-DEKODIERUNG - MIT INVERTIERTER RELAIS-LOGIK
 # =============================================================================
@@ -276,7 +292,7 @@ def get_override_mode_text(val):
 def parse_arguments():
     """Parst Command-line Argumente für Pumpen-Override und Nachtabsenkung"""
     parser = argparse.ArgumentParser(
-        description='Heizungssteuerung v4.4.0',
+        description='Heizungssteuerung v4.5.0',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Override-Modi:
@@ -521,11 +537,6 @@ def run_sync(args):
         reason_hk = to_uint(reg[25]) & 0xFF  # [26]
         reason_br = to_uint(reg[26]) & 0xFF  # [27]
         
-        # WORKAROUND: BR Override-Bit aus Setpoint ableiten (bis PLC gefixt)
-        # Wenn BR Override aktiv ist (br_current > 0), dann Override-Bit setzen
-        if 'br_current' in locals() and br_current > 0:
-            reason_br = reason_br | BR_REASON_OVERRIDE
-        
         # Zusätzliche Temperaturen (signed!)
         temp_at_sps = to_int(reg[27]) / 100.0   # [28]
         temp_it_sps = to_int(reg[28]) / 100.0   # [29]
@@ -539,7 +550,17 @@ def run_sync(args):
         physical_status = decode_physical_outputs(qb0)
         
         # =====================================================================
-        # 6. SYSTEM-DIAGNOSE LESEN
+        # 6. OSCAT VORLAUF-SOLLTEMPERATUR LESEN
+        # =====================================================================
+        soll_result = client.read_holding_registers(ADDR_SETPOINTS + SETPOINT_VL_SOLL, 1, slave=0)
+        if not soll_result.isError():
+            soll_raw = unsigned_to_signed(soll_result.registers[0])
+            temp_vorlauf_soll = soll_raw / 100.0 if soll_raw > 0 else None
+        else:
+            temp_vorlauf_soll = None
+        
+        # =====================================================================
+        # 7. SYSTEM-DIAGNOSE LESEN
         # =====================================================================
         sys_result = client.read_holding_registers(ADDR_SYSTEM, 8, slave=0)
         if not sys_result.isError():
@@ -560,7 +581,7 @@ def run_sync(args):
             cpu_load = 0
         
         # =====================================================================
-        # 7. NACHTABSENKUNGSZEITEN AUSLESEN (FÜR ANZEIGE)
+        # 8. NACHTABSENKUNGSZEITEN AUSLESEN (FÜR ANZEIGE)
         # =====================================================================
         nacht_result = client.read_holding_registers(ADDR_SETPOINTS + SETPOINT_NACHT_START, 2, slave=0)
         if not nacht_result.isError():
@@ -577,7 +598,7 @@ def run_sync(args):
             nacht_end_display = 4
         
         # =====================================================================
-        # 8. AUSGABE
+        # 9. AUSGABE
         # =====================================================================
         print("=" * 80)
         print(f"HEIZUNGSSTEUERUNG v{VERSION} | {now.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -592,6 +613,9 @@ def run_sync(args):
         print(f"  KE: {temp_ke:6.2f}°C | WW: {temp_ww:6.2f}°C | RU: {temp_ru:6.2f}°C")
         print(f"  SO: {temp_so:6.2f}°C | OT: {temp_ot:.2f}")
         print(f"  ΔT(Kessel-WW): {temp_diff_ww:.2f}°C")
+        
+        if temp_vorlauf_soll is not None:
+            print(f"  VL-Soll: {temp_vorlauf_soll:.2f}°C (OSCAT)")
         
         if mqtt_temp is not None:
             print(f"  MQTT: {mqtt_temp}°C")
@@ -613,7 +637,7 @@ def run_sync(args):
         print("=" * 80)
         
         # =====================================================================
-        # 9. DATENBANK
+        # 10. DATENBANK
         # =====================================================================
         # Berechne Stunden für DB (FLOAT!)
         runtime_ww_h = runtime_ww_sec / 3600.0
@@ -641,10 +665,11 @@ def run_sync(args):
                           ky9a, status_word, di8_raw,
                           reason_ww, reason_hk, reason_br,
                           runtime_ww_h, runtime_hk_h, runtime_br_h,
-                          cycles_ww, cycles_hk, cycles_br, temp_wassertank)
+                          cycles_ww, cycles_hk, cycles_br, temp_wassertank,
+                          temp_vorlauf_soll)
                          VALUES (%s,%s,%s,%s, %s,%s,%s, %s,%s,%s,%s, %s,%s,%s,%s, 
                                  %s,%s,%s, %s,%s,%s,%s, %s,%s,%s, %s,%s,%s,
-                                 %s,%s,%s, %s,%s,%s, %s)"""
+                                 %s,%s,%s, %s,%s,%s, %s, %s)"""
                 
                 # Version als String speichern um Patch nicht zu verlieren
                 sps_ver = f"{major}.{minor}.{patch}" if patch > 0 else f"{major}.{minor}"
@@ -660,13 +685,21 @@ def run_sync(args):
                     reason_ww, reason_hk, reason_br,  # Raw Byte-Werte für spätere Analyse
                     runtime_ww_h, runtime_hk_h, runtime_br_h,
                     cycles_ww, cycles_hk, cycles_br,
-                    temp_tank  # R290 Wassertank-Temperatur
+                    temp_tank,  # R290 Wassertank-Temperatur
+                    temp_vorlauf_soll  # OSCAT Solltemperatur
                 ))
             
             conn.commit()
             print("✓ Daten gespeichert")
         finally:
             conn.close()
+        
+        # =====================================================================
+        # 11. MQTT PUBLISHING
+        # =====================================================================
+        if temp_vorlauf_soll is not None:
+            if publish_mqtt('heizung/vorlauf_soll', round(temp_vorlauf_soll, 2)):
+                print(f"✓ MQTT: heizung/vorlauf_soll = {temp_vorlauf_soll:.2f}°C")
     
     except Exception as e:
         print(f"✗ Fehler: {e}")

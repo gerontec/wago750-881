@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-# heizung2.py v4.3.0 - MIT INVERTIERTEN RELAIS & WASSERTANK
+# heizung2.py v4.4.0 - MIT OSCAT ZIELTEMPERATUR
 import pymysql, sys, pandas as pd
 from datetime import datetime
 from pymodbus.client import ModbusTcpClient
@@ -20,7 +20,7 @@ from sqlalchemy import create_engine, text
 # MW95   = 12383  = xMeasure[64] - Letztes Measure-Register
 #
 # SETPOINTS (von Python geschrieben, von SPS gelesen):
-# MW96   = 12384  = xSetpoints[1]
+# MW96   = 12384  = xSetpoints[1]  - OSCAT Vorlauf-Solltemperatur (*100)
 # MW107  = 12395  = xSetpoints[12]
 # MW108  = 12396  = xSetpoints[13] - R290 Wassertank-Temperatur (*100)
 # MW109  = 12397  = xSetpoints[14] - WW Pumpen-Override (-1/0/1)
@@ -55,6 +55,18 @@ def get_mqtt():
         return mqtt_val if mqtt_rx else None
     except: return None
 
+def publish_mqtt(topic, value):
+    """Publiziert Wert zu MQTT Broker"""
+    try:
+        c = mqtt.Client()
+        c.connect('localhost', 1883, 60)
+        c.publish(topic, str(value), qos=1, retain=True)
+        c.disconnect()
+        return True
+    except Exception as e:
+        print(f"✗ MQTT publish failed: {e}")
+        return False
+
 calc_pt = lambda r: round((r-7134)/25, 2) if 4000<r<25000 else 0.0
 calc_bo = lambda r: round((40536-r)/303.1, 2) if 4000<r<45000 else 0.0
 calc_so = lambda r: round((r-26402)/60, 2) if 4000<r<40000 else 0.0
@@ -64,8 +76,8 @@ to_s = lambda v: v if v<32768 else v-65536
 def dec_rea(r, t):
     if r==0: return "AUS"
     if t=='WW': return "ΔT≥2°C" if r&1 else ""
-    if t=='HK': return "+".join([x for b,x in [(1,"Frost"),(2,"Wärme"),(4,"Ovr")] if r&b])
-    return "HK aktiv" if r&1 else ""
+    if t=='HK': return "+".join([x for b,x in [(1,"Frost"),(2,"VL<Soll"),(128,"Ovr")] if r&b])
+    return "Auto-On" if r&1 else ""
 
 def fmt_rt(sec):
     """Formatiert Runtime aus Sekunden in Tage, Stunden, Minuten"""
@@ -134,11 +146,19 @@ def ensure_schema(eng):
         if cv < 9:
             tbl_ex = c.execute(text("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='wagodb' AND table_name='heizung'")).scalar()
             if tbl_ex:
-                # Prüfe ob Spalte bereits existiert
                 col_ex = c.execute(text("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='wagodb' AND table_name='heizung' AND column_name='temp_wassertank'")).scalar()
                 if not col_ex:
                     c.execute(text("ALTER TABLE heizung ADD COLUMN temp_wassertank DECIMAL(5,2) DEFAULT NULL COMMENT 'R290 Wassertank-Temperatur'"))
                     c.execute(text("INSERT INTO schema_version(version,description) VALUES(9,'Added R290 tank temperature column')"))
+        
+        # Schema-Version 10: OSCAT Vorlauf-Solltemperatur
+        if cv < 10:
+            tbl_ex = c.execute(text("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='wagodb' AND table_name='heizung'")).scalar()
+            if tbl_ex:
+                col_ex = c.execute(text("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='wagodb' AND table_name='heizung' AND column_name='temp_vorlauf_soll'")).scalar()
+                if not col_ex:
+                    c.execute(text("ALTER TABLE heizung ADD COLUMN temp_vorlauf_soll DECIMAL(5,2) DEFAULT NULL COMMENT 'OSCAT Heizkurve Solltemperatur'"))
+                    c.execute(text("INSERT INTO schema_version(version,description) VALUES(10,'Added OSCAT target temperature column')"))
 
 now = datetime.now(); mqtt_t = get_mqtt(); eng = create_engine(DB_URL, pool_pre_ping=True)
 ensure_schema(eng); cl = ModbusTcpClient(SPS_IP, 502, timeout=5)
@@ -180,9 +200,6 @@ try:
     qb0 = qb.registers[0]&255 if not qb.isError() else 0
     
     # Dekodiere Pumpen mit invertierter Relais-Logik
-    # Bit 1 (0x02): O1_WWPump     - FALSE = AN (invertiert!)
-    # Bit 2 (0x04): O2_UmwaelzHK1 - FALSE = AN (invertiert!)
-    # Bit 3 (0x08): O3_Brunnen    - TRUE  = AN (normal)
     ww_pump = not bool(qb0 & 0x02)   # Invertiert!
     hk_pump = not bool(qb0 & 0x04)   # Invertiert!
     br_pump = bool(qb0 & 0x08)       # Normal
@@ -195,6 +212,14 @@ try:
     else:
         temp_tank = None
     
+    # OSCAT Vorlauf-Solltemperatur lesen (xSetpoints[1] = MW96 = 12384)
+    soll_result = cl.read_holding_registers(12384, 1, 0)
+    if not soll_result.isError():
+        soll_raw = to_s(soll_result.registers[0])
+        temp_vorlauf_soll = soll_raw / 100.0 if soll_raw > 0 else None
+    else:
+        temp_vorlauf_soll = None
+    
     ph = 'A' if sw&16 else 'B'
     data = {'version': sps_version, 'sensor_gruppe':ph, 'zeitstempel':now, 'stunde':now.hour,
             'zaehler_kwh':0, 'zaehler_pumpe':0, 'zaehler_brunnen':0,
@@ -206,21 +231,30 @@ try:
             'reason_ww':rww, 'reason_hk':rhk, 'reason_br':rbr,
             'runtime_ww_h':rtw_h, 'runtime_hk_h':rth_h, 'runtime_br_h':rtb_h,
             'cycles_ww':cyw, 'cycles_hk':cyh, 'cycles_br':cyb,
-            'temp_wassertank': temp_tank}
+            'temp_wassertank': temp_tank,
+            'temp_vorlauf_soll': temp_vorlauf_soll}
     
     print("="*80)
-    print(f"HEIZUNG v4.3 | {now:%Y-%m-%d %H:%M:%S} | SPS v{sps_version} | Phase {ph}")
+    print(f"HEIZUNG v4.4.0 | {now:%Y-%m-%d %H:%M:%S} | SPS v{sps_version} | Phase {ph}")
     print(f"VL:{data['temp_vorlauf']:.1f}°C AT:{data['temp_aussen']:.1f}°C IT:{data['temp_innen']:.1f}°C KE:{data['temp_kessel']:.1f}°C")
     print(f"WW:{data['temp_warmwasser']:.1f}°C RU:{data['temp_ruecklauf']:.1f}°C SO:{data['temp_solar']:.1f}°C")
     if temp_tank: print(f"R290-Tank:{temp_tank:.1f}°C")
+    if temp_vorlauf_soll: print(f"VL-Soll:{temp_vorlauf_soll:.1f}°C (OSCAT)")
     if mqtt_t: print(f"MQTT:{mqtt_t}°C")
     print(f"Pumpen: WW={'AN' if ww_pump else 'AUS'} HK={'AN' if hk_pump else 'AUS'} BR={'AN' if br_pump else 'AUS'}")
     print(f"Runtime: WW={fmt_rt(rtw_sec)}({cyw}×) HK={fmt_rt(rth_sec)}({cyh}×) BR={fmt_rt(rtb_sec)}({cyb}×)")
     print(f"Reason: WW={dec_rea(rww,'WW')} HK={dec_rea(rhk,'HK')} BR={dec_rea(rbr,'BR')}")
     print("="*80)
     
+    # Datenbank speichern
     pd.DataFrame([data]).to_sql('heizung', eng, if_exists='append', index=False)
     print("✓ Gespeichert")
+    
+    # MQTT Publishing
+    if temp_vorlauf_soll is not None:
+        if publish_mqtt('heizung/vorlauf_soll', round(temp_vorlauf_soll, 2)):
+            print(f"✓ MQTT: heizung/vorlauf_soll = {temp_vorlauf_soll:.2f}°C")
+    
 except Exception as e:
     print(f"✗ {e}")
     import traceback; traceback.print_exc()
