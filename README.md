@@ -1,6 +1,6 @@
 # WAGO 750-881 Heating Control System
 
-Professional heating control system for WAGO 750-881 PLC with Python monitoring and MySQL data logging.
+Professional heating control system for WAGO 750-881 PLC with Python monitoring, MySQL data logging, and heat pump integration.
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![PLC](https://img.shields.io/badge/PLC-WAGO%20750--881-orange.svg)](https://www.wago.com)
@@ -8,21 +8,32 @@ Professional heating control system for WAGO 750-881 PLC with Python monitoring 
 
 ## Overview
 
-Control system for oil heating with 3 pumps (hot water, heating circuit, well pump) featuring temperature-based control logic, override functionality, and comprehensive monitoring via Modbus TCP.
+Multi-source heating control system featuring:
+- **Oil Heating Control**: WAGO 750-881 PLC with 3 pumps (hot water, heating circuit, well pump)
+- **R290 Heat Pump Integration**: Powerworld R290 air-water heat pump via Modbus RTU
+- **Cross-System Optimization**: Automatic load sharing between oil boiler and heat pump
+- **Temperature-based Control**: ΔT logic, override functionality, comprehensive monitoring
 
 ### Hardware Configuration
 
+#### WAGO 750-881 PLC
 * **PLC**: WAGO 750-881 (Modbus TCP Master)
 * **Sensors**: 
-  - 5× PT1000 temperature sensors (boiler, hot water, heating circuit, outdoor, return)
-  - 2× NTC temperature sensors (multiplexed)
+  - 5× PT1000 temperature sensors
+  - 2× NTC temperature sensors
   - 1× Oil tank level sensor
 * **Outputs**: 3× Pump relays + Multiplexer control
 * **Inputs**: 8-channel digital input card
 
+#### Powerworld R290 Heat Pump
+* **Connection**: Modbus RTU (RS485)
+* **Port**: /dev/ttyUSB3 @ 9600 baud
+* **Integration**: Tank temperature shared with WAGO PLC
+* **Data Logging**: MySQL + MQTT publishing
+
 ## System Components
 
-### PLC Program (v6.4.8)
+### PLC Program (v6.5.2)
 
 **Main Program Files:**
 * `heizung.st` - Main control logic (Structured Text)
@@ -36,28 +47,32 @@ Control system for oil heating with 3 pumps (hot water, heating circuit, well pu
 * **Reason code tracking**: Detailed logging why pumps are on/off
 * **Night mode**: Reduced heating during configurable night hours
 * **Frost protection**: Automatic activation below threshold temperature
-* **Fail-safe design**: All critical functions have safety fallbacks
+* **Fail-safe design**: Inverted relay logic for critical pumps
 
 **Control Logic:**
-- Hot water pump: Boiler > HW tank + 2°C
-- Heating pump: Boiler > HC flow + 2°C  
-- Well pump: Linked to heating pump operation
+- Hot water pump: Boiler > HW tank + 2°C (runs 24/7, ignores night mode)
+- Heating pump: Boiler > HC flow + 2°C (respects night mode, frost override)
+- Well pump: Always ON (continuous circulation)
 - All pumps respect override settings and safety limits
 
 ### Python Scripts
 
-#### heizung3.py (v3.8.3) - Interactive Monitoring
+#### heizung3.py (v4.1.0) - Enhanced Interactive Monitor
 
-Manual monitoring tool with real-time status display.
+Complete physical I/O monitoring with bit-level explanations.
 
 **Features:**
-* **Graphical DI/DO display**: Visual representation of all inputs/outputs
-* **Runtime statistics**: Per-pump runtime hours and cycle counts
-* **Override control**: Interactive pump override management
-* **LED test mode**: Test all outputs
-* **Temperature monitoring**: All sensor values with formatting
-* **Reason code display**: Shows why each pump is active/inactive
-* **Status word decoding**: Multiplexer phase, night mode, errors
+* **Complete I/O Display**:
+  - All analog inputs (%IW0-%IW3) with RAW, voltage, temperature
+  - Digital inputs (%IW4) with 8-bit breakdown
+  - Digital outputs (%QB0) with inverted relay logic explained
+* **Graphical Status Display**: Visual DI/DO with color-coded LEDs
+* **Runtime Statistics**: Per-pump runtime hours and cycle counts
+* **Override Control**: Interactive pump override management
+* **LED Test Mode**: Test all outputs sequentially
+* **Status Word Decoding**: Complete bit explanation
+* **Reason Code Display**: Shows why each pump is active/inactive
+* **I/O Mapping Reference**: Built-in documentation
 
 **Usage:**
 ```bash
@@ -75,21 +90,55 @@ Automated data logging system for cron execution.
 * **Schema versioning**: Automatic database schema updates
 * **SQLAlchemy ORM**: Type-safe database operations
 * **Error handling**: Robust connection management
-* **Pandas integration**: Efficient data processing
-
-**Database Schema V7:**
-- Timestamp tracking
-- All temperature sensors
-- Pump states and runtime
-- Cycle counters
-- Reason codes
-- Override states
-- System status word
 
 **Cron Setup:**
 ```bash
 # Log every 60 seconds
 * * * * * ~/wago750-881/heizung2.py >> /var/log/heizung.log 2>&1
+```
+
+#### r290mb.py (v1.0.0) - R290 Heat Pump Logger
+
+Modbus RTU data logger for Powerworld R290 heat pump with WAGO integration.
+
+**Features:**
+* **Complete Data Collection**:
+  - Status and fault flags (11 registers)
+  - Temperature sensors (8 measurements)
+  - Technical parameters (compressor, fan, pump speeds)
+  - Operating mode and parameters
+* **Multi-Target Distribution**:
+  - MySQL database logging (always active)
+  - MQTT publishing (conditional)
+  - WAGO PLC integration (tank temperature)
+* **Conditional Transmission**: Only sends to MQTT/WAGO when tank temp > 0°C
+* **Cross-System Optimization**: Shares R290 tank temp with WAGO for load balancing
+* **Error Handling**: Complete validation and logging
+
+**Hardware:**
+- Connection: /dev/ttyUSB3 (USB-to-RS485 adapter)
+- Protocol: Modbus RTU, 9600 baud, Slave ID 1
+- Integration: Tank temp → WAGO register 12396 (%MW110)
+
+**Usage:**
+```bash
+./r290mb.py
+
+# Cron job (every 5 minutes)
+*/5 * * * * ~/wago750-881/r290mb.py >> /var/log/r290mb.log 2>&1
+```
+
+**WAGO Integration:**
+```st
+(* Read R290 tank temperature in PLC *)
+R290_Tank_Raw := xSetpoints[13];  (* Register 12396 *)
+R290_Tank_Temp := INT_TO_REAL(R290_Tank_Raw) / 100.0;
+
+(* Use for load optimization *)
+IF (R290_Tank_Temp > 40.0) AND (temp_kessel < 50.0) THEN
+    (* R290 has hot water, reduce oil boiler load *)
+    bHK_Enable := FALSE;
+END_IF;
 ```
 
 #### wagostatus.py (v1.1.0) - Complete Status Overview
@@ -103,12 +152,7 @@ Comprehensive system diagnostic tool.
 * **Modbus register documentation**: Full address mapping
 * **System diagnostics**: Uptime, error counts, CPU load
 
-**Usage:**
-```bash
-./wagostatus.py
-```
-
-#### Supporting Scripts
+### Supporting Scripts
 
 * **wagoglobal.py** - Shared functions and constants
 * **debug.py** - Troubleshooting and register debugging
@@ -130,6 +174,10 @@ sudo apt-get install python3 python3-pip git
 
 # Python dependencies
 pip3 install pymodbus pymysql paho-mqtt sqlalchemy pandas --break-system-packages
+
+# For R290 heat pump (USB-to-RS485 access)
+sudo usermod -a -G dialout $USER
+# Logout and login again for group change
 ```
 
 ### PLC Setup
@@ -141,7 +189,7 @@ pip3 install pymodbus pymysql paho-mqtt sqlalchemy pandas --break-system-package
 5. Download to PLC (Online → Login)
 
 **PLC Configuration:**
-- IP Address: 192.168.1.100 (default)
+- IP Address: 192.168.1.100 (or your configured address)
 - Modbus TCP Port: 502
 - Slave ID: 0
 
@@ -154,13 +202,16 @@ git clone git@github.com:gerontec/wago750-881.git
 cd wago750-881
 
 # Make scripts executable
-chmod +x heizung2.py heizung3.py wagostatus.py reset_runtime.py
+chmod +x heizung2.py heizung3.py wagostatus.py r290mb.py reset_runtime.py
 
-# Configure database connection in heizung2.py
+# Configure database connection in heizung2.py and r290mb.py
 # Edit MySQL credentials and MQTT broker settings
 
-# Test connection
+# Test WAGO connection
 ./wagostatus.py
+
+# Test R290 connection (if heat pump installed)
+./r290mb.py
 ```
 
 ### Database Setup
@@ -168,58 +219,57 @@ chmod +x heizung2.py heizung3.py wagostatus.py reset_runtime.py
 ```bash
 # Create MySQL database
 mysql -u root -p << EOF
-CREATE DATABASE heating_control;
-GRANT ALL PRIVILEGES ON heating_control.* TO 'heating'@'localhost' IDENTIFIED BY 'your_password';
+CREATE DATABASE wagodb;
+GRANT ALL PRIVILEGES ON wagodb.* TO 'heating'@'localhost' IDENTIFIED BY 'your_password';
 FLUSH PRIVILEGES;
 EOF
 
-# Schema will be created automatically by heizung2.py on first run
+# Schemas will be created automatically on first run
+# - heizung2.py creates heating_log table
+# - r290mb.py creates heat_powerw table
 ```
 
 ## Modbus Register Mapping
 
-### Holding Registers (Slave 0)
+### WAGO PLC Holding Registers (Slave 0)
 
 #### Measurement Data (xMeasure[1..32]) – Starting at 12320 (%MW32 - %MW63)
 
 | Address | PLC Variable | Description |
 |---------|-------------|-------------|
-| 12320 | %MW32 | Raw Analog Input %IW0 (0-32767) |
-| 12321 | %MW33 | Raw Analog Input %IW1 |
-| 12322 | %MW34 | Raw Analog Input %IW2 |
-| 12323 | %MW35 | Raw Analog Input %IW3 |
-| 12324 | %MW36 | Digital Input %IW4 (DI8chan) |
-| 12330 | %MW42 | Status Word (see below) |
+| 12320 | %MW32 | Raw Analog Input %IW0 (Boiler temp sensor) |
+| 12321 | %MW33 | Raw Analog Input %IW1 (HW tank sensor) |
+| 12322 | %MW34 | Raw Analog Input %IW2 (HC flow sensor) |
+| 12323 | %MW35 | Raw Analog Input %IW3 (Outdoor sensor) |
+| 12324 | %MW36 | Digital Input %IW4 (8-channel DI card) |
+| 12330 | %MW42 | Status Word (see bit mapping below) |
 | 12336 | %MW48 | Hot Water Pump Runtime (hours) |
 | 12337 | %MW49 | Hot Water Pump Cycles |
 | 12338 | %MW50 | Heating Pump Runtime (hours) |
 | 12339 | %MW51 | Heating Pump Cycles |
 | 12340 | %MW52 | Well Pump Runtime (hours) |
 | 12341 | %MW53 | Well Pump Cycles |
-| 12342 | %MW54 | Reserved |
-| 12343 | %MW55 | Reserved |
-| 12344 | %MW56 | Hot Water Pump Reason Code |
-| 12345 | %MW57 | Heating Pump Reason Code |
-| 12346 | %MW58 | Well Pump Reason Code |
-| 12347 | %MW59 | Reserved Reason Code |
+| 12344 | %MW54 | Hot Water Pump Reason Code |
+| 12345 | %MW55 | Heating Pump Reason Code |
+| 12346 | %MW56 | Well Pump Reason Code |
 | 12351 | %MW63 | Physical Output Byte %QB0 |
 
 **Status Word (%MW42) Bit Mapping:**
-- Bit 0-2: Reserved
+- Bit 0: WW Pump Active (compensates for inverted relay logic)
+- Bit 1: HK Pump Active (compensates for inverted relay logic)
+- Bit 2: Well Pump Active
 - Bit 3: Night mode active
-- Bit 4: Multiplexer Phase (0=A, 1=B)
+- Bit 4: Multiplexer Phase (0=A/8s, 1=B/51s)
 - Bit 5: Data ready flag
 - Bit 6: Sensor error
 - Bit 7-15: Reserved
 
-**Reason Codes:**
-- 0x00: Off - No demand
-- 0x01: On - ΔT threshold exceeded
-- 0x02: On - Override active
-- 0x03: Off - Override inactive
-- 0x04: Off - Safety limit
-- 0x05: On - Frost protection
-- 0x06: Off - Night mode
+**Output Byte (%QB0 / Register 512) Bit Mapping:**
+- Bit 0: Multiplexer Relay (switches sensor groups)
+- Bit 1: Hot Water Pump (INVERTED LOGIC! LOW=ON via NC relay)
+- Bit 2: Heating Pump (INVERTED LOGIC! LOW=ON via NC relay)
+- Bit 3: Well Pump (direct control)
+- Bit 4-7: Reserved
 
 #### Setpoint Data (xSetpoints[1..16]) – Starting at 12384 (%MW96 - %MW111)
 
@@ -229,12 +279,12 @@ EOF
 | 12385 | %MW97 | Heating Circuit Target Temp (°C × 10) |
 | 12388 | %MW100 | Night Mode Start Hour |
 | 12389 | %MW101 | Night Mode End Hour |
+| 12396 | %MW108 | **R290 Tank Temperature** (°C × 100, from r290mb.py) |
 | 12397 | %MW109 | Frost Protection Threshold (°C × 10) |
 | 12398 | %MW110 | Tank Temperature (°C × 10) |
-| 12400 | %MW112 | Hot Water Pump Override (0=Auto, 1=Force On, 2=Force Off) |
-| 12401 | %MW113 | Heating Pump Override |
-| 12402 | %MW114 | Well Pump Override |
-| 12403 | %MW115 | Reserved Override |
+| 12402 | %MW114 | Hot Water Pump Override (0=Auto, 1=Force On, 2=Force Off) |
+| 12403 | %MW115 | Heating Pump Override |
+| 12404 | %MW116 | Well Pump Override |
 
 #### System Diagnostics (xSystem[1..8]) – Starting at 12416 (%MW128 - %MW135)
 
@@ -244,32 +294,30 @@ EOF
 | 12417 | %MW129 | Uptime High Word (seconds) |
 | 12418 | %MW130 | Error Count |
 | 12419 | %MW131 | CPU Load (%) |
-| 12420-12423 | %MW132-135 | Reserved for future use |
 
-### Output Register Mapping
+### R290 Heat Pump Modbus Registers (Slave 1, RS485)
 
-| Address | PLC Variable | Description |
-|---------|-------------|-------------|
-| 512 | %QB0 | Physical output byte (direct relay control) |
+See `R290_INTEGRATION.md` for complete register mapping.
 
-**%QB0 Bit Mapping:**
-- Bit 0: Hot Water Pump
-- Bit 1: Heating Circuit Pump
-- Bit 2: Well Pump
-- Bit 3: Multiplexer Control A
-- Bit 4: Multiplexer Control B
-- Bit 5-7: Reserved
+**Key Registers:**
+- 0x03-0x0D: Status and fault flags
+- 0x0E-0x1C: Temperature sensors (inlet, tank, ambient, outlet, etc.)
+- 0x1C-0x2F: Technical parameters (compressor, fan, pump speeds)
+- 0x3F-0x43: Operating mode and parameters
 
 ## Usage Examples
 
 ### Interactive Monitoring
 
 ```bash
-# Launch real-time monitoring interface
+# Launch WAGO monitoring interface
 ./heizung3.py
 
-# Monitor specific pump
-./heizung3.py | grep "Hot Water"
+# Monitor R290 heat pump
+./r290mb.py
+
+# Complete system status
+./wagostatus.py
 
 # Check runtime statistics
 ./wagostatus.py | grep -A 5 "Runtime"
@@ -283,56 +331,70 @@ from pymodbus.client import ModbusTcpClient
 client = ModbusTcpClient('192.168.1.100')
 
 # Force hot water pump ON
-client.write_register(12400, 1)
+client.write_register(12402, 1)
 
 # Force heating pump OFF
-client.write_register(12401, 2)
+client.write_register(12403, 2)
 
 # Return to automatic mode
-client.write_register(12400, 0)
-client.write_register(12401, 0)
+client.write_register(12402, 0)
+client.write_register(12403, 0)
+
+client.close()
+```
+
+### Cross-System Temperature Monitoring
+
+```python
+# Read both systems
+from pymodbus.client import ModbusTcpClient
+
+client = ModbusTcpClient('192.168.1.100')
+
+# WAGO oil boiler temps
+result = client.read_holding_registers(12336, 10)
+boiler_temp = result.registers[0] / 100.0
+
+# R290 heat pump tank temp (shared via r290mb.py)
+result = client.read_holding_registers(12396, 1)
+r290_tank = result.registers[0] / 100.0
+
+print(f"Oil Boiler: {boiler_temp:.1f}°C")
+print(f"R290 Tank: {r290_tank:.1f}°C")
 
 client.close()
 ```
 
 ### Data Analysis
 
-```python
-import pymysql
-import pandas as pd
+```sql
+-- Average runtime per day (WAGO system)
+SELECT 
+    DATE(zeitstempel) as date,
+    MAX(ww_pump_runtime) - MIN(ww_pump_runtime) as ww_daily_hours,
+    MAX(hk_pump_runtime) - MIN(hk_pump_runtime) as hk_daily_hours
+FROM heating_log 
+WHERE zeitstempel > DATE_SUB(NOW(), INTERVAL 30 DAY)
+GROUP BY DATE(zeitstempel)
+ORDER BY date DESC;
 
-# Connect to database
-conn = pymysql.connect(
-    host='localhost',
-    user='heating',
-    password='your_password',
-    database='heating_control'
-)
-
-# Query runtime data
-df = pd.read_sql("""
-    SELECT timestamp, 
-           ww_pump_runtime, 
-           hk_pump_runtime,
-           ww_pump_cycles
-    FROM heating_log 
-    WHERE timestamp > DATE_SUB(NOW(), INTERVAL 7 DAY)
-""", conn)
-
-# Calculate daily runtime
-daily_runtime = df.groupby(df['timestamp'].dt.date).agg({
-    'ww_pump_runtime': 'max',
-    'hk_pump_runtime': 'max'
-})
-
-print(daily_runtime)
+-- R290 heat pump efficiency
+SELECT 
+    DATE(zeitstempel) as date,
+    AVG(temp_tank) as avg_tank_temp,
+    AVG(comp_power) as avg_power,
+    COUNT(*) * 5 / 60 as runtime_hours
+FROM heat_powerw
+WHERE DATE(zeitstempel) = CURDATE()
+AND comp_freq_actual > 0
+GROUP BY DATE(zeitstempel);
 ```
 
 ## Troubleshooting
 
 ### Common Issues
 
-**PLC not responding:**
+**WAGO PLC not responding:**
 ```bash
 # Check network connectivity
 ping 192.168.1.100
@@ -342,8 +404,22 @@ ping 192.168.1.100
 
 # Check PLC status LEDs
 # - Green: Power OK
-# - Yellow: Program running
-# - Red: Error state
+# - Yellow: Program running (should blink)
+# - Red: Error state (should be OFF)
+```
+
+**R290 Heat Pump connection issues:**
+```bash
+# Check USB-to-RS485 adapter
+ls -l /dev/ttyUSB*
+
+# Check permissions
+groups $USER  # Should include 'dialout'
+
+# Test Modbus RTU connection
+python3 -c "from pymodbus.client import ModbusSerialClient; \
+    c = ModbusSerialClient(method='rtu', port='/dev/ttyUSB3', baudrate=9600); \
+    print('Connected' if c.connect() else 'Failed'); c.close()"
 ```
 
 **Python script errors:**
@@ -351,8 +427,8 @@ ping 192.168.1.100
 # Check dependencies
 pip3 list | grep -E 'pymodbus|pymysql|paho-mqtt'
 
-# Verify PLC address in scripts
-grep "ModbusTcpClient" *.py
+# Verify addresses in scripts
+grep "WAGO_IP\|PLC_IP\|PORT" *.py
 
 # Enable debug logging
 MODBUS_DEBUG=1 ./heizung3.py
@@ -361,89 +437,126 @@ MODBUS_DEBUG=1 ./heizung3.py
 **Database connection issues:**
 ```bash
 # Test MySQL connection
-mysql -u heating -p heating_control
+mysql -u heating -p wagodb
 
-# Check schema version
+# Check schema versions
 SELECT * FROM schema_version;
 
-# Repair tables if needed
-mysqlcheck -u heating -p --auto-repair heating_control
-```
-
-**Runtime counter reset:**
-```bash
-# Reset all runtime counters
-./reset_runtime.py
-
-# Reset specific pump (edit script as needed)
-# Writes 0 to runtime registers 12336-12341
+# View recent entries
+SELECT * FROM heating_log ORDER BY zeitstempel DESC LIMIT 5;
+SELECT * FROM heat_powerw ORDER BY zeitstempel DESC LIMIT 5;
 ```
 
 ## Project Structure
 
 ```
 wago750-881/
-├── README.md                 # This file
-├── .gitignore               # Git ignore rules
+├── README.md                    # This file
+├── .gitignore                   # Git ignore rules
 │
 ├── PLC Files/
-│   ├── heizung.st           # Main PLC program (ST)
-│   └── globalvar.st         # Global variables
+│   ├── heizung.st              # Main PLC program (ST) v6.5.2
+│   └── globalvar.st            # Global variables
 │
 ├── Python Scripts/
-│   ├── heizung2.py          # Data logger (v3.9.1)
-│   ├── heizung3.py          # Interactive monitor (v3.8.3)
-│   ├── wagostatus.py        # Status overview (v1.1.0)
-│   ├── wagoglobal.py        # Shared functions
-│   ├── debug.py             # Debug utilities
-│   └── reset_runtime.py     # Runtime reset tool
+│   ├── heizung2.py             # Data logger v3.9.1 (WAGO)
+│   ├── heizung3.py             # Interactive monitor v4.1.0 (WAGO)
+│   ├── r290mb.py               # R290 heat pump logger v1.0.0
+│   ├── wagostatus.py           # Status overview v1.1.0
+│   ├── wagoglobal.py           # Shared functions
+│   ├── debug.py                # Debug utilities
+│   └── reset_runtime.py        # Runtime reset tool
+│
+├── Documentation/
+│   ├── io_reference.txt        # Complete I/O hardware reference
+│   └── R290_INTEGRATION.md     # R290 heat pump integration guide
 │
 └── Setup Scripts/
-    ├── setup_wago750.sh     # PLC setup script
-    └── setupgit.sh          # Git configuration
+    ├── setup_wago750.sh        # PLC setup script
+    └── setupgit.sh             # Git configuration
 ```
 
 ## Version History
 
 ### Current Versions
 
-- **PLC Program**: v6.4.8 (heizung.st)
+- **PLC Program**: v6.5.2 (heizung.st)
 - **Data Logger**: v3.9.1 (heizung2.py)
-- **Monitor**: v3.8.3 (heizung3.py)
+- **Monitor**: v4.1.0 (heizung3.py)
+- **R290 Logger**: v1.0.0 (r290mb.py)
 - **Status Tool**: v1.1.0 (wagostatus.py)
-- **Database Schema**: V7
+- **Database Schema**: V7 (heating_log)
 
 ### Recent Updates (January 2026)
 
-**v6.4.8 (PLC):**
+**v6.5.2 (PLC):**
 - Implemented OSCAT ACTUATOR_PUMP function blocks
 - Added comprehensive reason code tracking
 - Improved runtime counter reliability (NON-RETAIN)
 - Enhanced override functionality with state validation
 - Optimized ΔT calculation for better efficiency
 - Added frost protection logic
+- Implemented inverted relay logic for WW/HK pumps
 
-**v3.9.1 (heizung2.py):**
-- Upgraded to Database Schema V7
-- Added automatic schema migration
-- Implemented MQTT status publishing
-- Enhanced error handling and logging
-- Added runtime and cycle counter persistence
-- SQLAlchemy ORM integration
+**v4.1.0 (heizung3.py):**
+- Complete physical I/O display (all analog/digital inputs)
+- Bit-level output explanations with inverted relay logic
+- Corrected output mapping (DO.0 = Multiplexer!)
+- Enhanced status word decoding
+- Added I/O mapping reference display
+- Color-coded LED indicators
+- Interactive override control menu
 
-**v3.8.3 (heizung3.py):**
-- Improved graphical status display
-- Added reason code visualization
-- Enhanced override control interface
-- Better error message formatting
-- Real-time status word decoding
+**v1.0.0 (r290mb.py):**
+- NEW: Powerworld R290 heat pump integration
+- Modbus RTU data collection (status, temps, technical params)
+- MySQL database logging (heat_powerw table)
+- MQTT publishing (r290/heatpump/all)
+- WAGO PLC integration (tank temp to register 12396)
+- Conditional transmission logic (only when tank > 0°C)
+- Complete error handling and validation
 
-**v1.1.0 (wagostatus.py):**
-- Complete Modbus register documentation
-- Physical I/O display with raw values
-- System diagnostics display
-- Enhanced variable mapping
-- Sample & hold value calculation
+## Cross-System Integration
+
+### Load Balancing Strategy
+
+The system uses R290 heat pump as primary heat source when available:
+
+1. **R290 Priority**: Heat pump runs during mild weather (>5°C)
+2. **Boiler Backup**: Oil boiler activates in cold weather or high demand
+3. **Temperature Sharing**: R290 tank temp visible to WAGO PLC
+4. **Smart Switching**: PLC reduces boiler load when R290 provides heat
+
+### Data Flow
+
+```
+┌───────────────┐
+│ R290 Heat Pump│
+│  (Modbus RTU) │
+└───────┬───────┘
+        │ r290mb.py (every 5 min)
+        ├─────────────┐
+        ▼             ▼
+   ┌─────────┐   ┌─────────┐
+   │  MySQL  │   │  MQTT   │
+   │ wagodb  │   │ Broker  │
+   └─────────┘   └─────────┘
+        │             │
+        │             │ Tank Temp
+        │             ▼
+        │      ┌──────────────┐
+        │      │  WAGO PLC    │
+        │      │ (Reg 12396)  │
+        │      └──────┬───────┘
+        │             │
+        │             │ heizung2.py (every 60s)
+        │             ▼
+        └──────►┌─────────┐
+                │  MySQL  │
+                │ heating │
+                │  _log   │
+                └─────────┘
+```
 
 ## Development
 
@@ -489,55 +602,19 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 * WAGO Kontakttechnik GmbH for the excellent PLC hardware
 * OSCAT community for open-source PLC function blocks
 * PyModbus developers for the robust Modbus library
+* Powerworld for R290 heat pump documentation
 
 ## Contact
 
 Project Link: [https://github.com/gerontec/wago750-881](https://github.com/gerontec/wago750-881)
 
-## Appendix
+## Additional Documentation
 
-### Temperature Sensor Mapping
-
-| Sensor | Type | Location | Register |
-|--------|------|----------|----------|
-| T1 | PT1000 | Boiler | %IW0 → Sample & Hold |
-| T2 | PT1000 | Hot Water Tank | %IW1 → Sample & Hold |
-| T3 | PT1000 | Heating Circuit | %IW2 → Sample & Hold |
-| T4 | PT1000 | Outdoor | %IW3 → Sample & Hold |
-| T5 | PT1000 | Return Flow | Multiplexed Phase A |
-| T6 | NTC | Auxiliary 1 | Multiplexed Phase B |
-| T7 | NTC | Auxiliary 2 | Multiplexed Phase B |
-
-### Typical Temperature Values
-
-- Boiler: 60-80°C (operational), 40-60°C (standby)
-- Hot Water Tank: 45-60°C (target)
-- Heating Circuit: 30-50°C (depending on outdoor temp)
-- Outdoor: -20 to +40°C
-- Return Flow: 30-45°C
-
-### Safety Features
-
-* **Overheat Protection**: Pump shutdown at >85°C boiler temp
-* **Frost Protection**: Automatic pump activation at <5°C
-* **Sensor Error Handling**: Safe mode operation if sensor fails
-* **Override Safety**: Timeout limits on manual overrides
-* **Fail-Safe Outputs**: All outputs OFF on PLC error
-
-### MQTT Topics
-
-```
-heating/status              # General status (JSON)
-heating/temperatures        # All temperature sensors
-heating/pumps/hotwater      # Hot water pump state
-heating/pumps/heating       # Heating pump state
-heating/pumps/well          # Well pump state
-heating/runtime             # Runtime statistics
-heating/errors              # Error messages
-```
+- **io_reference.txt**: Complete hardware I/O mapping and troubleshooting
+- **R290_INTEGRATION.md**: Detailed R290 heat pump integration guide
 
 ---
 
 **Last Updated**: January 6, 2026  
-**Version**: 1.2.0  
+**Version**: 2.0.0  
 **Maintainer**: gerontec
