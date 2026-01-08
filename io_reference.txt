@@ -1,28 +1,132 @@
 # WAGO 750-881 Physical I/O Reference
-# Complete Hardware Mapping Documentation
+# Complete Hardware Mapping Documentation v1.1
+
+## Digital Output Cards
+
+### Card Slot 3: 750-530 (8-Channel Digital Output 24V DC)
+
+**CRITICAL: Output Logic is INVERTED for pumps via relay boards!**
+
+| Terminal | PLC Variable | Bit Position | Load | Logic | Description |
+|----------|--------------|--------------|------|-------|-------------|
+| DO.0 | Output_0 | %QB0.0 | Mux Relay | DIRECT | Multiplexer Switching Relay |
+| DO.1 | O1_WWPump | %QB0.1 | Relay Board | INVERTED | Hot Water Pump (NC relay) |
+| DO.2 | O2_UmwaelzHK1 | %QB0.2 | Relay Board | INVERTED | Heating Circuit Pump (NC relay) |
+| DO.3 | O3_Brunnen | %QB0.3 | Pump | DIRECT | Well Pump (Brunnenpumpe) |
+| DO.4 | - | %QB0.4 | - | - | Reserved / Unused |
+| DO.5 | - | %QB0.5 | - | - | Reserved / Unused |
+| DO.6 | - | %QB0.6 | - | - | Reserved / Unused |
+| DO.7 | - | %QB0.7 | - | - | Reserved / Unused |
+
+**Modbus Access:** Register 512 (%QB0)
+
+**INVERTED RELAY LOGIC EXPLANATION:**
+
+The WW and HK pumps use **normally-closed (NC) relay boards**:
+- PLC Output LOW (0) → Relay energized → Pump runs
+- PLC Output HIGH (1) → Relay de-energized → Pump stops
+
+**From ST Code (lines 213-221, 250-258):**
+```st
+(* Invertierte Relais-Logik *)
+O1_WWPump := NOT ACTUATOR_WW.PUMP;   (* WW Pump inverted *)
+O2_UmwaelzHK1 := NOT ACTUATOR_HK.PUMP; (* HK Pump inverted *)
+O3_Brunnen := TRUE;                   (* Well pump direct *)
+```
+
+**Technical Details:**
+- Output Voltage: 24V DC (provided externally)
+- Max Current: 0.5A per channel
+- Protection: Short circuit proof, overload protected
+- Switching Time: <100µs
+- Isolation: 500V DC (channel to bus)
+
+**Load Specifications:**
+- Pumps WW/HK: 24V DC relay boards with NC contacts (~50mA coil)
+- Well Pump: Direct 24V DC control (~100mA)
+- Multiplexer: Solid-state relay input (~20mA)
+
+**Wiring Example:**
+```
+24V+ ──────────┬─────┤DO.0├───[Mux Relay]────┤Multiplexer
+               ├─────┤DO.1├───[NC Relay]─────┤WW Pump (inverted!)
+               ├─────┤DO.2├───[NC Relay]─────┤HK Pump (inverted!)
+               └─────┤DO.3├───────────────────┤Well Pump (direct)
+
+GND ───────────┤COM (separate power supply for loads)
+```
 
 ## Analog Input Cards
 
 ### Card Slot 1: 750-461 (4-Channel Analog Input 0-10V)
 
-| Terminal | PLC Address | Modbus Register | Signal Type | Sensor | Description |
-|----------|-------------|-----------------|-------------|---------|-------------|
-| AI0+ / AI0- | %IW0 | 12320 | PT1000 | T1 | Boiler Temperature (Kessel) |
-| AI1+ / AI1- | %IW1 | 12321 | PT1000 | T2 | Hot Water Tank (Warmwasser) |
-| AI2+ / AI2- | %IW2 | 12322 | PT1000 | T3 | Heating Circuit Flow (Heizkreis Vorlauf) |
-| AI3+ / AI3- | %IW3 | 12323 | PT1000 | T4 | Outdoor Temperature (Außentemperatur) |
+**Multiplexer Operation:**
+
+The system uses a **single relay** on DO.0 to switch between two sensor sets:
+
+**Phase A (Output_0 = FALSE / mux_state = FALSE):**
+- Duration: 8 seconds
+- AI0 → Warmwasser (NTC) = S_Warmw
+- AI1 → Öltank = S_Oeltank  
+- AI2 → Rücklauf (PT1000) = S_Ruecklauf
+- AI3 → Solar (NTC) = S_Solar
+
+**Phase B (Output_0 = TRUE / mux_state = TRUE):**
+- Duration: 51 seconds
+- AI0 → Vorlauf (PT1000) = S_Vorlauf
+- AI1 → Außen (PT1000) = S_Aussen
+- AI2 → Innen (PT1000) = S_Innen
+- AI3 → Kessel (PT1000) = S_Kessel
+
+**Settling Time:** 2 seconds after phase switch before sampling
+
+| Terminal | PLC Address | Modbus Register | Phase A Sensor | Phase B Sensor |
+|----------|-------------|-----------------|----------------|----------------|
+| AI0+ / AI0- | %IW0 | 12320 | NTC Warmwasser | PT1000 Vorlauf |
+| AI1+ / AI1- | %IW1 | 12321 | Öltank | PT1000 Außen |
+| AI2+ / AI2- | %IW2 | 12322 | PT1000 Rücklauf | PT1000 Innen |
+| AI3+ / AI3- | %IW3 | 12323 | NTC Solar | PT1000 Kessel |
+
+**From ST Code (lines 153-173):**
+```st
+Output_0 := mux_state;  (* Multiplexer relay control *)
+
+IF bDataReady THEN
+    IF mux_state THEN
+        (* Phase B - 51 seconds *)
+        S_Vorlauf := analog0;
+        S_Aussen  := analog1;
+        S_Innen   := analog2;
+        S_Kessel  := analog3;
+    ELSE
+        (* Phase A - 8 seconds *)
+        S_Warmw     := analog0;
+        S_Oeltank   := analog1;
+        S_Ruecklauf := analog2;
+        S_Solar     := analog3;
+    END_IF;
+END_IF;
+```
 
 **Technical Details:**
 - Resolution: 15-bit + sign (0-32767)
 - Voltage Range: 0-10V DC
 - PT1000 Interface: Via signal converter (PT1000 → 0-10V)
-- Sample Rate: ~100ms per channel
+- NTC Interface: Via voltage divider circuit
 - Accuracy: ±0.1% of full scale
 
-**Conversion Formula:**
-```
-Voltage [V] = (Raw_Value / 32767) × 10.0
-Temperature [°C] = Voltage × 10.0  (depends on converter calibration)
+**Conversion Formulas (from ST code lines 175-234):**
+```st
+(* PT1000 Conversion *)
+U_PT := (WORD_TO_REAL(raw_value) / 32768.0) * 10.0;  (* ADC to Voltage *)
+ohm_value := (U_PT * R_Mess) / (U_Vers - U_PT);     (* Voltage to Ohm *)
+temp := TEMP_PT(ohm_value, PT1000_R0);               (* Ohm to °C *)
+
+(* NTC Conversion - Warmwasser *)
+temp_warmw := (NTC_BOILER_A - raw_value) / NTC_BOILER_B;
+
+(* NTC Conversion - Solar *)
+temp_solar := (raw_value - NTC_SOLAR_A) / NTC_SOLAR_B;
 ```
 
 ## Digital Input Cards
@@ -31,14 +135,14 @@ Temperature [°C] = Voltage × 10.0  (depends on converter calibration)
 
 | Terminal | PLC Address | Bit Position | Signal | Description |
 |----------|-------------|--------------|--------|-------------|
-| DI.0 | %IW4.0 | Bit 0 | Door_Contact | Safety door contact switch |
-| DI.1 | %IW4.1 | Bit 1 | Flow_Switch | Heating circuit flow monitor |
-| DI.2 | %IW4.2 | Bit 2 | External_Enable | Remote enable signal |
-| DI.3 | %IW4.3 | Bit 3 | Emergency_Stop | E-Stop button (NC contact) |
-| DI.4 | %IW4.4 | Bit 4 | Mode_Select | Operating mode selector |
-| DI.5 | %IW4.5 | Bit 5 | Reserved | Future expansion |
-| DI.6 | %IW4.6 | Bit 6 | Reserved | Future expansion |
-| DI.7 | %IW4.7 | Bit 7 | Reserved | Future expansion |
+| DI.0 | %IW4.0 | Bit 0 | - | Reserved / Unused |
+| DI.1 | %IW4.1 | Bit 1 | - | Reserved / Unused |
+| DI.2 | %IW4.2 | Bit 2 | - | Reserved / Unused |
+| DI.3 | %IW4.3 | Bit 3 | - | Reserved / Unused |
+| DI.4 | %IW4.4 | Bit 4 | - | Reserved / Unused |
+| DI.5 | %IW4.5 | Bit 5 | - | Reserved / Unused |
+| DI.6 | %IW4.6 | Bit 6 | - | Reserved / Unused |
+| DI.7 | %IW4.7 | Bit 7 | - | Reserved / Unused |
 
 **Modbus Access:** Register 12324 (%MW36 = %IW4)
 
@@ -49,110 +153,46 @@ Temperature [°C] = Voltage × 10.0  (depends on converter calibration)
 - Isolation: 500V DC (channel to bus)
 - Filter Time: Configurable (default 3ms)
 
-**Wiring:**
-```
-24V+ ─┬──[Switch]──┤DI.0
-      ├──[Switch]──┤DI.1
-      ├──[Switch]──┤DI.2
-      └──[Switch]──┤DI.3
-                     │
-GND ─────────────────┤COM
-```
-
-## Digital Output Cards
-
-### Card Slot 3: 750-530 (8-Channel Digital Output 24V DC)
-
-| Terminal | PLC Address | Bit Position | Load | Description |
-|----------|-------------|--------------|------|-------------|
-| DO.0 | %QB0.0 | Bit 0 | Pump_WW | Hot Water Circulation Pump |
-| DO.1 | %QB0.1 | Bit 1 | Pump_HK | Heating Circuit Pump |
-| DO.2 | %QB0.2 | Bit 2 | Pump_BR | Well Pump (Brunnenpumpe) |
-| DO.3 | %QB0.3 | Bit 3 | Mux_A | Multiplexer Control Phase A |
-| DO.4 | %QB0.4 | Bit 4 | Mux_B | Multiplexer Control Phase B |
-| DO.5 | %QB0.5 | Bit 5 | Reserved | Future expansion |
-| DO.6 | %QB0.6 | Bit 6 | Reserved | Future expansion |
-| DO.7 | %QB0.7 | Bit 7 | Reserved | Future expansion |
-
-**Modbus Access:** Register 512 (%QB0)
-
-**Technical Details:**
-- Output Voltage: 24V DC (provided externally)
-- Max Current: 0.5A per channel
-- Protection: Short circuit proof, overload protected
-- Switching Time: <100µs
-- Isolation: 500V DC (channel to bus)
-
-**Load Specifications:**
-- Pumps: 24V DC contactor coils (~50mA each)
-- Multiplexer: Solid-state relay inputs (~20mA)
-
-**Wiring Example:**
-```
-24V+ ──────────┬─────┤DO.0├───[Relay Coil]──┤Pump Motor WW
-               ├─────┤DO.1├───[Relay Coil]──┤Pump Motor HK
-               └─────┤DO.2├───[Relay Coil]──┤Pump Motor BR
-
-GND ───────────┤COM (separate power supply for loads)
-```
+**Note:** Digital inputs currently not used in PLC logic (version 6.5.2)
 
 ## Status Word Bit Mapping (%MW42 / Register 12330)
 
+**From ST Code (lines 314-320):**
+```st
+(* Status-Word mit invertierten Pumpen *)
+IF O1_WWPump = FALSE THEN status_word := status_word + INT#1; END_IF;    (* Bit 0 *)
+IF O2_UmwaelzHK1 = FALSE THEN status_word := status_word + INT#2; END_IF; (* Bit 1 *)
+IF O3_Brunnen THEN status_word := status_word + INT#4; END_IF;           (* Bit 2 *)
+IF bNachtAbsenkung THEN status_word := status_word + INT#8; END_IF;      (* Bit 3 *)
+IF mux_state THEN status_word := status_word + INT#16; END_IF;           (* Bit 4 *)
+IF bDataReady THEN status_word := status_word + INT#32; END_IF;          (* Bit 5 *)
+IF bSensorError THEN status_word := status_word + INT#64; END_IF;        (* Bit 6 *)
+```
+
 | Bit | Name | Description | Set (1) | Clear (0) |
 |-----|------|-------------|---------|-----------|
-| 0 | RESERVED | Future use | - | - |
-| 1 | RESERVED | Future use | - | - |
-| 2 | RESERVED | Future use | - | - |
+| 0 | WW_PUMP_ACTIVE | Hot water pump | Pump ON | Pump OFF |
+| 1 | HK_PUMP_ACTIVE | Heating pump | Pump ON | Pump OFF |
+| 2 | BR_PUMP_ACTIVE | Well pump | Pump ON | Pump OFF |
 | 3 | NIGHT_MODE | Reduced heating | Night active | Day mode |
-| 4 | MUX_PHASE | Multiplexer state | Phase B | Phase A |
-| 5 | DATA_READY | Sample complete | Valid data | Sampling |
+| 4 | MUX_PHASE | Multiplexer state | Phase B (51s) | Phase A (8s) |
+| 5 | DATA_READY | Sample complete | Valid data | Settling |
 | 6 | SENSOR_ERROR | Sensor fault | Error detected | All OK |
-| 7 | SYS_ERROR | System error | Critical fault | Normal |
-| 8-15 | RESERVED | Future expansion | - | - |
+| 7-15 | RESERVED | Future expansion | - | - |
+
+**IMPORTANT:** Bits 0 and 1 reflect the **actual pump state**, not the output pin state!
+- Bit set = Pump is running
+- This compensates for the inverted relay logic
 
 **Example Values:**
-- 0x0000 (0) = All normal, day mode, phase A
+- 0x0000 (0) = All pumps OFF, day mode, phase A
+- 0x0001 (1) = WW pump ON
+- 0x0003 (3) = WW + HK pumps ON
+- 0x0007 (7) = All pumps ON
 - 0x0008 (8) = Night mode active
 - 0x0010 (16) = Multiplexer on phase B
 - 0x0020 (32) = Data ready flag set
 - 0x0040 (64) = Sensor error detected
-- 0x0038 (56) = Night mode + Phase B + Data ready
-
-## Multiplexer Operation
-
-The system uses a 2-phase multiplexer to read additional sensors with limited analog inputs.
-
-### Multiplexer Control Logic:
-
-**Phase A (Mux_A=HIGH, Mux_B=LOW):**
-- Reads: T5 (Return flow temperature - PT1000)
-- Duration: 200ms settling time
-- Then: Sample & Hold to internal register
-
-**Phase B (Mux_A=LOW, Mux_B=HIGH):**
-- Reads: T6, T7 (Auxiliary NTC sensors)
-- Duration: 200ms settling time
-- Then: Sample & Hold to internal registers
-
-**Cycle Time:** 500ms total (Phase A → Phase B → Process)
-
-## Runtime Counter Implementation
-
-Runtime counters are stored in **NON-RETAIN** memory to survive PLC power cycles.
-
-### Runtime Registers:
-
-| Pump | Runtime Address | Cycles Address | Unit | Max Value |
-|------|----------------|----------------|------|-----------|
-| Hot Water (WW) | 12336 (%MW48) | 12337 (%MW49) | hours | 65535 |
-| Heating (HK) | 12338 (%MW50) | 12339 (%MW51) | hours | 65535 |
-| Well (BR) | 12340 (%MW52) | 12341 (%MW53) | hours | 65535 |
-
-**Update Logic:**
-- Runtime increments every 3600 seconds of ON time
-- Cycles increment on each OFF→ON transition
-- Values persist through PLC restarts
-- Values can be reset via Modbus write
 
 ## Reason Code System
 
@@ -160,153 +200,198 @@ Each pump has an associated reason code explaining its current state.
 
 ### Reason Code Registers:
 
-| Pump | Register | Description |
-|------|----------|-------------|
-| Hot Water | 12344 (%MW54) | WW pump state reason |
-| Heating | 12345 (%MW55) | HK pump state reason |
-| Well | 12346 (%MW56) | BR pump state reason |
+| Pump | Register | Variable | Description |
+|------|----------|----------|-------------|
+| Hot Water | 12344 (%MW48) | bWW_Reason | WW pump state reason |
+| Heating | 12345 (%MW49) | bHK_Reason | HK pump state reason |
+| Well | 12346 (%MW50) | bBR_Reason | BR pump state reason |
 
-### Reason Code Values:
+### Reason Code Values (from ST code):
 
+**WW Pump (lines 184-205):**
 | Code | Hex | Meaning | Pump State |
 |------|-----|---------|------------|
-| 0 | 0x00 | No demand (ΔT < threshold) | OFF |
+| 0 | 0x00 | No demand (ΔT < 2°C) | OFF |
 | 1 | 0x01 | ΔT threshold exceeded | ON |
-| 2 | 0x02 | Override - forced ON | ON |
-| 3 | 0x03 | Override - forced OFF | OFF |
-| 4 | 0x04 | Safety limit reached | OFF |
-| 5 | 0x05 | Frost protection active | ON |
-| 6 | 0x06 | Night mode - reduced heating | OFF |
-| 16 | 0x10 | Test mode | ON |
-| 255 | 0xFF | Unknown/Error state | ? |
+| 4 | 0x04 | Override active | ON/OFF |
+
+**HK Pump (lines 207-256):**
+| Code | Hex | Name | Meaning |
+|------|-----|------|---------|
+| 0 | 0x00 | - | No demand | OFF |
+| 1 | 0x01 | HK_REASON_WAERMEBEDARF | Heat demand (Vorlauf < 30°C) | ON |
+| 2 | 0x02 | HK_REASON_FROSTSCHUTZ | Frost protection (Außen < threshold) | ON |
+| 4 | 0x04 | HK_REASON_OVERRIDE | Override active | ON/OFF |
+
+**BR Pump (lines 258-280):**
+| Code | Hex | Name | Meaning |
+|------|-----|------|---------|
+| 1 | 0x01 | BR_REASON_HK_ACTIVE | Always ON (default) | ON |
+| 4 | 0x04 | BR_REASON_OVERRIDE | Override active | ON/OFF |
+
+**Note:** Reason codes can be combined (OR operation) for HK pump
 
 ## Override Control System
 
 ### Override Registers:
 
-| Pump | Register | Function |
-|------|----------|----------|
-| Hot Water | 12400 (%MW112) | WW pump override |
-| Heating | 12401 (%MW113) | HK pump override |
-| Well | 12402 (%MW114) | BR pump override |
+| Pump | Register | Variable | Function |
+|------|----------|----------|----------|
+| Hot Water | 12402 (%MW110) | xSetpoints[14] | WW pump override |
+| Heating | 12403 (%MW111) | xSetpoints[15] | HK pump override |
+| Well | 12404 (%MW112) | xSetpoints[16] | BR pump override |
 
-### Override Values:
+### Override Values (from ST code):
 
 | Value | Mode | Behavior |
 |-------|------|----------|
-| 0 | AUTO | Normal automatic control via ΔT logic |
-| 1 | FORCE ON | Pump forced ON regardless of temperature |
-| 2 | FORCE OFF | Pump forced OFF regardless of temperature |
+| 0 | AUTO | Normal automatic control |
+| < 0 (negative) | FORCE OFF | Pump forced OFF |
+| > 0 (positive) | FORCE ON | Pump forced ON |
 
-**Safety Notes:**
-- Override timeout: 4 hours maximum
-- After timeout, system returns to AUTO mode
-- Override does NOT bypass safety limits (overheat, etc.)
-- Multiple simultaneous overrides are allowed
+**From ST Code - WW Example (lines 195-203):**
+```st
+IF xSetpoints[14] < INT#0 THEN
+    (* Force OFF *)
+    bWW_Enable := FALSE;
+    O1_WWPump := NOT FALSE;  (* = TRUE = relay OFF = pump OFF *)
+ELSIF xSetpoints[14] > INT#0 THEN
+    (* Force ON *)
+    bWW_Enable := TRUE;
+    O1_WWPump := NOT TRUE;   (* = FALSE = relay ON = pump ON *)
+ELSE
+    (* AUTO *)
+    O1_WWPump := NOT ACTUATOR_WW.PUMP;
+END_IF;
+```
 
-## Temperature Threshold Configuration
+## Runtime Counter Implementation
 
-### Setpoint Registers (Read/Write):
+Runtime counters are stored in **NON-RETAIN** memory to survive PLC power cycles.
 
-| Parameter | Register | Default | Range | Unit |
-|-----------|----------|---------|-------|------|
-| WW Target Temp | 12384 (%MW96) | 550 | 400-700 | °C × 10 |
-| HK Target Temp | 12385 (%MW97) | 450 | 300-600 | °C × 10 |
-| ΔT Threshold | - (hardcoded) | 20 | - | °C × 10 (2.0°C) |
-| Night Start | 12388 (%MW100) | 22 | 0-23 | hour |
-| Night End | 12389 (%MW101) | 6 | 0-23 | hour |
-| Frost Threshold | 12397 (%MW109) | 50 | 0-100 | °C × 10 |
+### Runtime Registers (from xMeasure array mapping):
 
-**Example:**
-- WW Target = 550 means 55.0°C
-- ΔT = 20 means 2.0°C
-- Pump activates when: T_Boiler ≥ T_Tank + 2.0°C
+| Pump | Runtime Register | Cycles Register | Variable | Max Value |
+|------|-----------------|-----------------|----------|-----------|
+| Hot Water | 12350 (%MW62) | 12353 (%MW65) | WW_Runtime/Cycles | 32767h |
+| Heating | 12351 (%MW63) | 12354 (%MW66) | HK_Runtime/Cycles | 32767h |
+| Well | 12352 (%MW64) | 12355 (%MW67) | BR_Runtime/Cycles | 32767h |
 
-## System Diagnostics
+**From ST Code (lines 329-358):**
+- Runtime stored in UDINT (seconds), converted to hours for Modbus
+- Cycles stored in UDINT, clamped to 32767 for INT registers
+- Updated by ACTUATOR function blocks
 
-### Diagnostic Registers:
+**ACTUATOR Function Block Parameters:**
+- MIN_ONTIME: Minimum ON duration before allowing OFF
+  - WW: 120 seconds
+  - HK: 5 minutes
+  - BR: 1 second
+- MIN_OFFTIME: Minimum OFF duration before allowing ON
+  - WW: 60 seconds
+  - HK: 2 minutes
+  - BR: 1 second
 
-| Parameter | Register | Type | Unit |
-|-----------|----------|------|------|
-| Uptime (Low) | 12416 (%MW128) | UINT32 (low) | seconds |
-| Uptime (High) | 12417 (%MW129) | UINT32 (high) | seconds |
-| Error Count | 12418 (%MW130) | UINT16 | count |
-| CPU Load | 12419 (%MW131) | UINT16 | % |
+## Temperature Control Logic
 
-**Uptime Calculation:**
-```python
-uptime_seconds = (high_word << 16) | low_word
-uptime_days = uptime_seconds / 86400
+### WW Pump (lines 184-205):
+```
+Enable if: temp_kessel - temp_warmw >= 2.0°C
+Ignores: Night mode (runs 24/7)
+```
+
+### HK Pump (lines 207-256):
+```
+Enable if:
+  (temp_vorlauf < 30°C AND NOT night_mode) OR
+  (temp_aussen < frost_threshold)
+  
+Night mode: Configurable via xSetpoints[5] and [6]
+Frost threshold: Configurable via xSetpoints[10]
+```
+
+### BR Pump (lines 258-280):
+```
+Enable: Always ON (unless forced OFF via override)
+Purpose: Continuous circulation
 ```
 
 ## Safety Features
 
-### Hardware Interlocks:
-
-1. **Thermal Cutoff:** External thermostat cuts power at 95°C
-2. **Emergency Stop:** NC contact on DI.3 (must be closed for operation)
-3. **Flow Switch:** Monitors circulation on DI.1
-4. **Pressure Relief:** Mechanical valve (not monitored by PLC)
-
 ### Software Safeties:
 
-1. **Overheat Protection:** 
-   - Shutdown at T_Boiler > 85°C
-   - Reason code 0x04
-   
-2. **Sensor Error Handling:**
-   - Watchdog on all PT1000 inputs
-   - Default to safe state (pumps OFF) on error
-   - Status word bit 6 set
-   
-3. **Pump Protection:**
-   - Minimum OFF time: 60 seconds
-   - Maximum ON time: 8 hours continuous
-   - Anti-cycling: 5 minute minimum between cycles
+1. **Sensor Error Handling:**
+   - Status word bit 6 indicates errors
+   - Invalid NTC readings (outside 4000-45000 range) set temp to 0
+
+2. **Pump Protection (ACTUATOR function blocks):**
+   - Minimum ON/OFF times prevent rapid cycling
+   - Runtime tracking for maintenance scheduling
+
+3. **Night Mode:**
+   - HK pump disabled during night hours (configurable)
+   - WW pump continues operation (hot water priority)
+   - Frost protection overrides night mode
+
+4. **Override Safety:**
+   - Manual control available for all pumps
+   - Bypass automatic logic when needed
 
 ## Troubleshooting Guide
 
-### Common Issues:
+### Pump Not Running:
 
-**No response from PLC:**
+**Check inverted relay logic:**
 ```bash
-# Check network
-ping 192.168.1.100
+# Read output byte
+modbus_read 192.168.1.100 512 1
 
-# Check Modbus port
-telnet 192.168.1.100 502
-
-# Verify PLC status LEDs:
-# - Green POWER: Solid ON
-# - Yellow RUN: Blinking (program running)
-# - Red ERROR: Should be OFF
+# Output interpretation (assuming result = 0x02):
+# Bit 0 (0) = Mux OFF
+# Bit 1 (1) = WW Pump OUTPUT HIGH = Relay OFF = Pump OFF (correct if no demand)
+# Bit 2 (0) = HK Pump OUTPUT LOW = Relay ON = Pump ON
+# Bit 3 (0) = Well Pump OFF
 ```
 
-**Analog input reads 0 or 32767:**
-- 0 = Sensor disconnected or shorted
-- 32767 = Sensor open circuit or converter error
-- Check PT1000 resistance: Should be ~1000Ω at 0°C
+**Check status word:**
+```bash
+# Read status word
+modbus_read 192.168.1.100 12330 1
 
-**Digital input not responding:**
-- Verify 24V supply voltage
-- Check terminal connections
-- Measure input voltage at terminal
-- Check DI LED on card (should light when active)
+# Status interpretation (result = 0x0003):
+# Bit 0 (1) = WW Pump ACTIVE
+# Bit 1 (1) = HK Pump ACTIVE
+# Bit 2 (0) = Well Pump INACTIVE
+```
 
-**Output not switching:**
-- Check load voltage supply (24V DC)
-- Verify load current < 0.5A
-- Check DO LED on card
-- Test with LED indicator instead of actual load
+**Note:** Output byte and status word bits 0-2 may appear opposite due to inverted relay logic!
 
-**Runtime counter not incrementing:**
-- Check if pump output is actually ON
-- Verify reason code is 0x01 or 0x02
-- Runtime updates only every hour (3600s)
+### Multiplexer Issues:
+
+**Check timing:**
+- Phase A: 8 seconds
+- Phase B: 51 seconds
+- Settling: 2 seconds
+
+**Verify DO.0 switching:**
+```bash
+# Monitor output over time
+watch -n 1 'modbus_read 192.168.1.100 512 1'
+```
 
 ---
 
-**Document Version:** 1.0  
+**Document Version:** 1.1  
 **Last Updated:** 2026-01-06  
+**PLC Program Version:** 6.5.2  
 **Author:** gerontec  
 **Hardware:** WAGO 750-881 + 750-461 + 750-430 + 750-530
+
+**Key Changes from v1.0:**
+- Corrected output mapping (DO.0 = Multiplexer, not pumps)
+- Documented inverted relay logic for WW/HK pumps
+- Corrected status word bit interpretation
+- Added multiplexer phase timing from ST code
+- Updated reason codes from actual constants
+- Corrected override register addresses
+- Added safety features from ST implementation
