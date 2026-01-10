@@ -42,7 +42,8 @@ mqtt_val, mqtt_rx = None, False
 def on_msg(c, u, m):
     global mqtt_val, mqtt_rx
     try: mqtt_val, mqtt_rx = float(m.payload.decode()), True
-    except: pass
+    except (ValueError, AttributeError, UnicodeDecodeError):
+        pass  # Invalid payload format - ignore and keep mqtt_rx=False
 
 def get_mqtt():
     global mqtt_val, mqtt_rx
@@ -53,7 +54,9 @@ def get_mqtt():
         while not mqtt_rx and time.time()-st < 5: time.sleep(0.1)
         c.loop_stop(); c.disconnect()
         return mqtt_val if mqtt_rx else None
-    except: return None
+    except Exception as e:
+        # MQTT connection failed - this is non-critical, continue without external temp
+        return None
 
 calc_pt = lambda r: round((r-7134)/25, 2) if 4000<r<25000 else 0.0
 calc_bo = lambda r: round((40536-r)/303.1, 2) if 4000<r<45000 else 0.0
